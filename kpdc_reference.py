@@ -226,6 +226,8 @@ class KPDC:
         Reuses pw's own plane if it already has a payload (overwrite).
         Returns the plane index used.
         """
+        if len(plaintext) >= (1 << 32):
+            raise ValueError("payload length exceeds 32-bit length field (max ~4 GiB)")
         prk = self._prk(pw)
         home = self._home(prk)
 
@@ -238,8 +240,10 @@ class KPDC:
                 pq = self.plane_of(q, maxprobe)
                 if pq is not None:
                     occupied.add(pq)
+            # Search only the window the reader probes; placing beyond
+            # min(maxprobe, K) would make the payload unreadable (silent loss).
             plane = None
-            for i in range(self.K):
+            for i in range(min(maxprobe, self.K)):
                 cand = (home + i) % self.K
                 if cand not in occupied:
                     plane = cand

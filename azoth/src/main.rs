@@ -26,9 +26,17 @@ struct KdfArgs {
     #[arg(long, default_value_t = 3)]
     kdf_iters: u32,
 }
+impl KdfArgs {
+    fn validate(&self) -> Result<()> {
+        if self.kdf_mem_mib == 0 || self.kdf_iters == 0 {
+            bail!("--kdf-mem-mib and --kdf-iters must each be >= 1");
+        }
+        Ok(())
+    }
+}
 impl From<KdfArgs> for KdfParams {
     fn from(a: KdfArgs) -> Self {
-        KdfParams { mem_kib: a.kdf_mem_mib.saturating_mul(1024).max(8), iters: a.kdf_iters.max(1), lanes: 1 }
+        KdfParams { mem_kib: a.kdf_mem_mib.saturating_mul(1024), iters: a.kdf_iters, lanes: 1 }
     }
 }
 
@@ -91,6 +99,7 @@ fn main() -> Result<()> {
             eprintln!("created {} ({} bytes, K={})", out, size, k);
         }
         Cmd::Write { file, password, k, data, known, maxprobe, kdf } => {
+            kdf.validate()?;
             warn_if_bad_k(k);
             let pw = resolve_password(password)?;
             let block = std::fs::read(&file).with_context(|| format!("reading {}", file))?;
@@ -104,6 +113,7 @@ fn main() -> Result<()> {
             eprintln!("wrote {} bytes into plane {}", plaintext.len(), plane);
         }
         Cmd::Read { file, password, k, maxprobe, kdf } => {
+            kdf.validate()?;
             warn_if_bad_k(k);
             let pw = resolve_password(password)?;
             let block = std::fs::read(&file).with_context(|| format!("reading {}", file))?;

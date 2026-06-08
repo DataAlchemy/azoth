@@ -74,10 +74,10 @@ $BIN read --file vault.bin --k $K --password mallory   # -> error: just noise
 As a library:
 
 ```rust
-use azoth::{Kpdc, next_prime_coprime8, DEFAULT_MAXPROBE};
+use azoth::{Kpdc, KdfParams, next_prime_coprime8, DEFAULT_MAXPROBE};
 
 let k = next_prime_coprime8(419);
-let mut c = Kpdc::create(65536, k)?;                          // 64 KiB of randomness
+let mut c = Kpdc::create(65536, k, KdfParams::default())?;    // 64 KiB of randomness
 c.write("alice", b"the treaty is signed at dawn", &[], DEFAULT_MAXPROBE, None)?;
 c.write("bob",   b"meet at pier 39, midnight", &["alice"], DEFAULT_MAXPROBE, None)?;
 
@@ -105,7 +105,7 @@ containers are *not* wire-compatible (different KDF and slot walk); each reads o
 
 ## ✦ Pinned primitives
 
-**scrypt** (memory-hard KDF) · **SHAKE256** (XOF/PRF) · **SHA-256** (fast hash) · **HMAC-SHA256** (integrity).
+**Argon2id** (memory-hard KDF; the Python reference uses scrypt) · **SHAKE256** (XOF/PRF) · **SHA-256** (fast hash) · **HMAC-SHA256** (integrity).
 
 ## ⚠ Status & honest scope
 

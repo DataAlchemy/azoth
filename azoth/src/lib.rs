@@ -127,16 +127,23 @@ fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
     m.finalize().into_bytes().into()
 }
 
+/// Validate KDF params up front so `argon2_kdf` can't fail mid-read (which would
+/// otherwise be indistinguishable from a wrong password).
+fn validate_kdf(p: KdfParams) -> Result<(), Error> {
+    Params::new(p.mem_kib, p.iters, p.lanes, Some(32)).map(|_| ()).map_err(|_| Error::Kdf)
+}
+
 /// Argon2id over `pw || K_be64` with the given cost. Output is zeroized on drop.
-fn argon2_kdf(pw: &[u8], k: u64, salt: &[u8], p: KdfParams) -> Result<Zeroizing<[u8; 32]>, Error> {
+/// Params are validated at container construction, so this is infallible here.
+fn argon2_kdf(pw: &[u8], k: u64, salt: &[u8], p: KdfParams) -> Zeroizing<[u8; 32]> {
     let mut input = Zeroizing::new(Vec::with_capacity(pw.len() + 8));
     input.extend_from_slice(pw);
     input.extend_from_slice(&k.to_be_bytes());
-    let params = Params::new(p.mem_kib, p.iters, p.lanes, Some(32)).map_err(|_| Error::Kdf)?;
+    let params = Params::new(p.mem_kib, p.iters, p.lanes, Some(32)).expect("KDF params validated at construction");
     let a = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
     let mut out = Zeroizing::new([0u8; 32]);
-    a.hash_password_into(&input, salt, &mut *out).map_err(|_| Error::Kdf)?;
-    Ok(out)
+    a.hash_password_into(&input, salt, &mut *out).expect("argon2id hash");
+    out
 }
 
 fn ct_eq(a: &[u8], b: &[u8]) -> bool {
@@ -170,7 +177,10 @@ fn xor(a: &[u8], b: &[u8]) -> Vec<u8> {
 pub fn next_prime_coprime8(n: u64) -> u64 {
     let mut c = std::cmp::max(3, n | 1); // force odd
     while !is_prime(c) {
-        c += 2;
+        c = match c.checked_add(2) {
+            Some(v) => v,
+            None => return c, // saturate near u64::MAX rather than wrap/panic
+        };
     }
     c
 }
@@ -184,12 +194,13 @@ fn is_prime(n: u64) -> bool {
     if n < 2 {
         return false;
     }
-    if n % 2 == 0 {
+    if n.is_multiple_of(2) {
         return n == 2;
     }
     let mut i = 3u64;
-    while i * i <= n {
-        if n % i == 0 {
+    while i <= n / i {
+        // `i <= n / i` instead of `i * i <= n` to avoid overflow near u64::MAX
+        if n.is_multiple_of(i) {
             return false;
         }
         i += 2;
@@ -254,6 +265,7 @@ impl Kpdc {
         if k < 2 || k > nbits {
             return Err(Error::InvalidK { k, nbits });
         }
+        validate_kdf(kdf)?;
         Ok(Kpdc { block, k, kdf })
     }
 
@@ -263,6 +275,7 @@ impl Kpdc {
         if k < 2 || k > nbits {
             return Err(Error::InvalidK { k, nbits });
         }
+        validate_kdf(kdf)?;
         let mut block = vec![0u8; size];
         getrandom::getrandom(&mut block).map_err(|_| Error::Rng)?;
         Ok(Kpdc { block, k, kdf })
@@ -347,10 +360,7 @@ impl Kpdc {
                 .collect();
 
             let salt = xor(&bits_to_bytes(&head[0..S_BITS]), &smask);
-            let mk = match argon2_kdf(pw.as_bytes(), self.k, &salt, self.kdf) {
-                Ok(mk) => mk,
-                Err(_) => return None,
-            };
+            let mk = argon2_kdf(pw.as_bytes(), self.k, &salt, self.kdf);
 
             let token = shake(&[&*mk, b"token"], T_BITS / 8);
             let stored_token = bits_to_bytes(&head[S_BITS..S_BITS + T_BITS]);
@@ -416,19 +426,21 @@ impl Kpdc {
             return Err(Error::PayloadTooLong { len: plaintext.len() });
         }
         let prk = self.prk(pw);
-        let home = self.home(&prk);
 
         let plane = match self.plane_of(pw, maxprobe) {
             Some(p) => p,
             None => {
+                let home = self.home(&prk);
                 let mut occupied = HashSet::new();
                 for q in known_pws {
                     if let Some(p) = self.plane_of(q, maxprobe) {
                         occupied.insert(p);
                     }
                 }
+                // Search only the window the reader will probe — placing a payload
+                // beyond min(maxprobe, K) would make it unreadable (silent loss).
                 let mut chosen = None;
-                for i in 0..self.k {
+                for i in 0..(maxprobe as u64).min(self.k) {
                     let cand = (home + i) % self.k;
                     if !occupied.contains(&cand) {
                         chosen = Some(cand);
@@ -455,7 +467,7 @@ impl Kpdc {
         };
 
         let smask = self.smask(&prk);
-        let mk = argon2_kdf(pw.as_bytes(), self.k, &salt, self.kdf)?;
+        let mk = argon2_kdf(pw.as_bytes(), self.k, &salt, self.kdf);
         let token = shake(&[&*mk, b"token"], T_BITS / 8);
         let lenmask = shake(&[&*mk, b"len"], LEN_BITS / 8);
         let stream = Zeroizing::new(shake(&[&*mk, b"stream"], plaintext.len()));
@@ -536,9 +548,36 @@ mod tests {
         bytes[12345] ^= 0xFF;
         let c2 = Kpdc::from_bytes(bytes, k, TP).unwrap();
         // either still reads (if flip missed this plane) or None — never wrong plaintext
-        match c2.read("pw", DEFAULT_MAXPROBE) {
-            Some(pt) => assert_eq!(pt.as_slice(), b"secret message here"),
-            None => {}
+        if let Some(pt) = c2.read("pw", DEFAULT_MAXPROBE) {
+            assert_eq!(pt.as_slice(), b"secret message here");
+        }
+    }
+
+    #[test]
+    fn write_success_implies_readable_at_same_maxprobe() {
+        // Regression: a successful write must never place a payload beyond the
+        // window the reader probes. With a small maxprobe and colliding known_pws,
+        // write either succeeds-and-is-readable or returns ContainerFull — never
+        // silently unrecoverable.
+        let k = next_prime_coprime8(17);
+        let mp = 3;
+        let mut c = Kpdc::create(16384, k, TP).unwrap();
+        let pws = ["a", "b", "c", "d", "e", "f"];
+        let mut written = Vec::new();
+        for (i, pw) in pws.iter().enumerate() {
+            let known: Vec<&str> = pws[..i].to_vec();
+            let msg = format!("msg-{}", i);
+            if c.write(pw, msg.as_bytes(), &known, mp, None).is_ok() {
+                written.push((*pw, msg));
+            }
+        }
+        for (pw, msg) in written {
+            assert_eq!(
+                c.read(pw, mp).map(|z| z.to_vec()),
+                Some(msg.into_bytes()),
+                "payload written under {:?} not readable at the same maxprobe",
+                pw
+            );
         }
     }
 }

@@ -133,9 +133,10 @@ not RFC-5869 HKDF — for a XOF this needs no extract/expand step.
 
 Intra-plane scatter visits a sequence of distinct plane-slot indices in `[0, M)`. Two
 realizations: (a) a linear stride walk `slot(j) = (start + j*stride) mod M` with `M`
-prime (full period); or (b) **a SHAKE-driven distinct-slot scatter with rejection
-sampling** — what `kpdc_reference.py` and the Rust `azoth` crate actually use, since it
-needs no primality constraint on `M` and has no modulo bias.
+prime (full period); or (b) **a SHAKE-driven distinct-slot scatter** — what both
+implementations use, since it needs no primality constraint on `M`. The Rust `azoth`
+crate adds **rejection sampling** (no modulo bias); the Python reference uses plain
+counter-mode `mod M` with a documented small bias.
 
 ---
 
@@ -236,10 +237,12 @@ cost is what raises brute-force cost.
 ## 12. Next steps
 
 - [DONE] Adversarial Phase-4 pass — see Section 11.
-- [DONE] Pinned primitives + runnable reference: `kpdc_reference.py` (stdlib only).
-  - memory-hard KDF = scrypt; XOF/PRF = SHAKE256; MAC = HMAC-SHA256; fast hash = SHA-256.
-  - intra-plane scatter = SHAKE-driven distinct-slot walk (counter mode). Self-test passes:
-    2 payloads / 2 passwords round-trip, wrong password -> None, block reads uniform-random.
-- Still open: rejection-sample slots (remove modulo bias); harden scrypt params; constant-probe
-  reads (A4); stride-walk-with-prime-plane variant; production-grade test vectors + KATs.
+- [DONE] Pinned primitives + two implementations:
+  - Python reference (`kpdc_reference.py`, stdlib only): scrypt; SHAKE256; HMAC-SHA256; SHA-256;
+    counter-mode distinct-slot walk (small modulo bias).
+  - Rust crate (`azoth/`): **Argon2id** (configurable, credential-bound cost); SHAKE256;
+    HMAC-SHA256; SHA-256; **rejection-sampled** distinct-slot walk (no bias); constant-time
+    compares; zeroized key material. NOT wire-compatible with the Python reference.
+- Still open: harden the Python reference (rejection sampling, Argon2id) for parity;
+  constant-probe reads (A4); stride-walk-with-prime-plane variant; production-grade test vectors + KATs.
 - V2: whole-block re-randomize write mode (multi-snapshot deniability).
