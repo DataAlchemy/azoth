@@ -1,4 +1,6 @@
-# multicrypt — K-Plane Deniable Container (KPDC)
+# azoth — K-Plane Deniable Container (KPDC)
+
+> *Azoth* — the alchemists' hidden universal essence, the secret agent of transmutation.
 
 A deniable encryption container: a fixed-size block of random-looking bytes that holds
 up to **K** independent encrypted payloads. Without the correct `(password, K)` the block
