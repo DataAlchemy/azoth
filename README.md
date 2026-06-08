@@ -86,8 +86,13 @@ c.read("bob",   DEFAULT_MAXPROBE);   // Some(b"meet at pier 39, midnight")
 c.read("mallory", DEFAULT_MAXPROBE); // None  (just noise)
 ```
 
+> Omit `--password` and azoth prompts for it without echo — preferred, since
+> passwords in CLI args leak via `ps` and shell history. The KDF cost (`--kdf-mem-mib`,
+> `--kdf-iters`) is part of the credential: read and write must use the same values.
+
 The **Python reference** (`kpdc_reference.py`) mirrors this for readability — run
-`python3 kpdc_reference.py` for the same self-test.
+`python3 kpdc_reference.py` for the same self-test. **Note:** the Python and Rust
+containers are *not* wire-compatible (different KDF and slot walk); each reads only its own.
 
 ## ✦ Map of the repo
 
@@ -107,9 +112,11 @@ The **Python reference** (`kpdc_reference.py`) mirrors this for readability — 
 Brainstorm output — **experimental, not security-audited. Do not protect anything real with it yet.**
 v1 targets deniability against a *single-look* inspector; multi-snapshot diffing (imaging the block
 before & after a write) is a known gap deferred to a V2 *whole-block re-randomize* mode — see spec
-§4 and §11. The Rust crate uses rejection sampling (no modulo bias) but still ships low KDF cost
-and non-constant-time probing — tune before any real use. The Python reference favors clarity over
-all of the above.
+§4 and §11. The Rust crate hardens the reference with **Argon2id** (configurable, credential-bound
+cost), **rejection-sampled** slots (no modulo bias), **constant-time** tag/token compares, **zeroized**
+key material, and **atomic** container writes. Two caveats remain by design: a *correct guess* still
+compromises that payload (the token is an offline oracle gated only by the KDF — use a strong password
+and high KDF cost), and the multi-snapshot gap above. The Python reference favors clarity over all of this.
 
 And remember: azoth hides *what* and *how much*, not *that a high-entropy blob exists* — pair it
 with a plausible cover (disk free space, a "wiped" partition, or a benign decoy payload).

@@ -21,6 +21,11 @@ THIS IS A READABLE REFERENCE, NOT PRODUCTION CODE.
   * scrypt parameters are low for demo speed; raise N for real use.
   * v1 scope: single-snapshot deniability only (see spec section 4). Multi-snapshot
     diffing leaks K; the V2 whole-block re-randomize mode is not implemented here.
+
+NOT WIRE-COMPATIBLE with the Rust crate (azoth/). The Rust implementation uses
+Argon2id (not scrypt) and a rejection-sampled XOF slot walk (not counter-mode
+modulo), so containers written by one cannot be read by the other. This file is a
+readable spec mirror, not an interoperable implementation.
 """
 
 import hashlib
@@ -169,7 +174,7 @@ class KPDC:
         home = self._home(prk)
         smask = self._smask(prk)
         head_n = S_BITS + T_BITS + LEN_BITS
-        for i in range(maxprobe):
+        for i in range(min(maxprobe, self.K)):   # only K distinct planes exist
             plane = (home + i) % self.K
             if head_n > self._plane_slots(plane):
                 continue

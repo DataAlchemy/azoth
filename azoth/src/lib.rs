@@ -5,22 +5,34 @@
 //! computationally indistinguishable from random data: no header, no index, no
 //! count. Different passwords decrypt to completely different plaintexts.
 //!
-//! This is the performant Rust port of the Python reference (`kpdc_reference.py`),
-//! faithful to spec v0.3 with two upgrades:
-//!   * **rejection sampling** for slot selection (removes the reference's modulo bias);
-//!   * compiled bit-walking instead of per-bit Python object overhead.
+//! This is the performant Rust implementation, faithful to spec v0.3 with
+//! security/quality upgrades over the Python reference (`kpdc_reference.py`):
+//!   * **Argon2id** memory-hard KDF with configurable, credential-bound cost;
+//!   * **rejection sampling** for slot selection (no modulo bias);
+//!   * **constant-time** token/tag comparison;
+//!   * **zeroization** of derived key material.
 //!
-//! Pinned primitives: scrypt (memory-hard KDF), SHAKE256 (XOF/PRF), SHA-256
-//! (fast hash), HMAC-SHA256 (integrity).
+//! ## Container format is NOT interoperable with the Python reference.
+//! The two use different slot walks (Rust: rejection-sampled XOF stream;
+//! Python: counter-mode modulo) and different KDFs (Argon2id vs scrypt). A
+//! container written by one cannot be read by the other. The Python file is a
+//! readable spec mirror, not a wire-compatible implementation.
+//!
+//! Pinned primitives: Argon2id (KDF), SHAKE256 (XOF/PRF), SHA-256 (fast hash),
+//! HMAC-SHA256 (integrity).
 //!
 //! **Experimental — not security audited. v1 = single-snapshot deniability only.**
 
+#![forbid(unsafe_code)]
+
+use argon2::{Algorithm, Argon2, Params, Version};
 use hmac::{Hmac, Mac};
-use scrypt::{scrypt, Params};
 use sha2::{Digest, Sha256};
 use sha3::digest::{ExtendableOutput, Update, XofReader};
 use sha3::Shake256;
 use std::collections::HashSet;
+use subtle::ConstantTimeEq;
+use zeroize::Zeroizing;
 
 // ---- field sizes (bits) ----
 const S_BITS: usize = 128; // per-write salt (nonce)
@@ -32,28 +44,57 @@ const HEAD_BITS: usize = S_BITS + T_BITS + LEN_BITS;
 /// Default open-addressing probe bound for reads.
 pub const DEFAULT_MAXPROBE: usize = 64;
 
-// ---- scrypt cost (raise N for real use) ----
-const SCRYPT_LOG_N: u8 = 13; // N = 2^13
-const SCRYPT_R: u32 = 8;
-const SCRYPT_P: u32 = 1;
+/// Memory-hard KDF cost. **Part of the credential** — read and write must use
+/// the same params (like `K`), since nothing is stored in the block.
+#[derive(Clone, Copy, Debug)]
+pub struct KdfParams {
+    pub mem_kib: u32,
+    pub iters: u32,
+    pub lanes: u32,
+}
+
+impl KdfParams {
+    /// Sensible default for real use (~64 MiB, 3 passes).
+    pub const INTERACTIVE: KdfParams = KdfParams { mem_kib: 65_536, iters: 3, lanes: 1 };
+    /// Low cost for tests/CI only — NOT for protecting real data.
+    pub const FAST_TEST: KdfParams = KdfParams { mem_kib: 8_192, iters: 1, lanes: 1 };
+}
+
+impl Default for KdfParams {
+    fn default() -> Self {
+        KdfParams::INTERACTIVE
+    }
+}
 
 #[derive(Debug)]
 pub enum Error {
+    InvalidK { k: u64, nbits: u64 },
     ContainerFull,
     PayloadTooLarge { need_bits: u64, plane_bits: u64 },
+    PayloadTooLong { len: usize },
     Rng,
+    Kdf,
 }
 
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Error::InvalidK { k, nbits } => write!(
+                f,
+                "invalid K={}: must satisfy 2 <= K <= block bit-count ({})",
+                k, nbits
+            ),
             Error::ContainerFull => write!(f, "container full: no free plane within probe bound"),
             Error::PayloadTooLarge { need_bits, plane_bits } => write!(
                 f,
                 "payload too large: needs {} bits but plane holds {} (raise block size or lower K)",
                 need_bits, plane_bits
             ),
+            Error::PayloadTooLong { len } => {
+                write!(f, "payload length {} exceeds u32 length field (max ~4 GiB)", len)
+            }
             Error::Rng => write!(f, "failed to gather randomness"),
+            Error::Kdf => write!(f, "KDF (Argon2id) failure — check parameters"),
         }
     }
 }
@@ -81,19 +122,25 @@ fn sha256_cat(parts: &[&[u8]]) -> [u8; 32] {
 
 type HmacSha256 = Hmac<Sha256>;
 fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
-    let mut m = <HmacSha256 as Mac>::new_from_slice(key).expect("hmac key");
+    let mut m = <HmacSha256 as Mac>::new_from_slice(key).expect("hmac accepts any key length");
     Mac::update(&mut m, msg);
     m.finalize().into_bytes().into()
 }
 
-fn scrypt_kdf(pw: &[u8], k: u64, salt: &[u8]) -> [u8; 32] {
-    let mut input = Vec::with_capacity(pw.len() + 8);
+/// Argon2id over `pw || K_be64` with the given cost. Output is zeroized on drop.
+fn argon2_kdf(pw: &[u8], k: u64, salt: &[u8], p: KdfParams) -> Result<Zeroizing<[u8; 32]>, Error> {
+    let mut input = Zeroizing::new(Vec::with_capacity(pw.len() + 8));
     input.extend_from_slice(pw);
     input.extend_from_slice(&k.to_be_bytes());
-    let params = Params::new(SCRYPT_LOG_N, SCRYPT_R, SCRYPT_P, 32).expect("scrypt params");
-    let mut out = [0u8; 32];
-    scrypt(&input, salt, &params, &mut out).expect("scrypt");
-    out
+    let params = Params::new(p.mem_kib, p.iters, p.lanes, Some(32)).map_err(|_| Error::Kdf)?;
+    let a = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+    let mut out = Zeroizing::new([0u8; 32]);
+    a.hash_password_into(&input, salt, &mut *out).map_err(|_| Error::Kdf)?;
+    Ok(out)
+}
+
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    a.ct_eq(b).into()
 }
 
 // ---- bit / byte helpers (LSB-first within each byte) ----
@@ -107,7 +154,7 @@ fn bytes_to_bits(bs: &[u8]) -> Vec<u8> {
     v
 }
 fn bits_to_bytes(bits: &[u8]) -> Vec<u8> {
-    let mut out = vec![0u8; (bits.len() + 7) / 8];
+    let mut out = vec![0u8; bits.len().div_ceil(8)];
     for (i, &b) in bits.iter().enumerate() {
         if b != 0 {
             out[i >> 3] |= 1 << (i & 7);
@@ -127,6 +174,12 @@ pub fn next_prime_coprime8(n: u64) -> u64 {
     }
     c
 }
+
+/// Whether `k` is a recommended plane count: an odd prime (so prime and coprime to 8).
+pub fn is_recommended_k(k: u64) -> bool {
+    k > 2 && k % 2 == 1 && is_prime(k)
+}
+
 fn is_prime(n: u64) -> bool {
     if n < 2 {
         return false;
@@ -144,23 +197,75 @@ fn is_prime(n: u64) -> bool {
     true
 }
 
+/// A resumable, distinct-slot pseudo-random walk inside one plane.
+/// SHAKE-driven XOF stream with rejection sampling (no modulo bias). Holding the
+/// reader lets the read path extend the walk instead of recomputing it.
+struct SlotWalk {
+    reader: Box<dyn XofReader>,
+    out: Vec<u64>,
+    seen: HashSet<u64>,
+    m: u64,
+    zone: u64,
+}
+
+impl SlotWalk {
+    fn new(prk: &[u8; 32], plane: u64, m: u64) -> Self {
+        let mut h = Shake256::default();
+        h.update(prk);
+        h.update(b"slots");
+        h.update(&plane.to_be_bytes());
+        SlotWalk {
+            reader: Box::new(h.finalize_xof()),
+            out: Vec::new(),
+            seen: HashSet::new(),
+            m,
+            zone: (u64::MAX / m) * m, // unbiased rejection threshold
+        }
+    }
+
+    /// Ensure at least `count` distinct slot indices have been produced.
+    fn ensure(&mut self, count: usize) {
+        let mut buf = [0u8; 8];
+        while self.out.len() < count {
+            self.reader.read(&mut buf);
+            let x = u64::from_be_bytes(buf);
+            if x >= self.zone {
+                continue;
+            }
+            let v = x % self.m;
+            if self.seen.insert(v) {
+                self.out.push(v);
+            }
+        }
+    }
+}
+
 /// A K-plane deniable container backed by a mutable byte block.
 pub struct Kpdc {
     block: Vec<u8>,
     k: u64,
+    kdf: KdfParams,
 }
 
 impl Kpdc {
-    /// Wrap an existing block (e.g. read from disk) with its plane count.
-    pub fn from_bytes(block: Vec<u8>, k: u64) -> Self {
-        Kpdc { block, k }
+    /// Wrap an existing block (e.g. read from disk) with its credential params.
+    pub fn from_bytes(block: Vec<u8>, k: u64, kdf: KdfParams) -> Result<Self, Error> {
+        let nbits = (block.len() as u64) * 8;
+        if k < 2 || k > nbits {
+            return Err(Error::InvalidK { k, nbits });
+        }
+        Ok(Kpdc { block, k, kdf })
     }
 
     /// Create a fresh container = `size` random bytes (indistinguishable from any full one).
-    pub fn create(size: usize, k: u64) -> Result<Self, Error> {
+    pub fn create(size: usize, k: u64, kdf: KdfParams) -> Result<Self, Error> {
+        let nbits = (size as u64) * 8;
+        if k < 2 || k > nbits {
+            return Err(Error::InvalidK { k, nbits });
+        }
         let mut block = vec![0u8; size];
         getrandom::getrandom(&mut block).map_err(|_| Error::Rng)?;
-        Ok(Kpdc { block, k })
+        Ok(Kpdc { block, k, kdf })
     }
 
     pub fn as_bytes(&self) -> &[u8] {
@@ -200,46 +305,32 @@ impl Kpdc {
     }
 
     // ---- derivations ----
-    fn prk(&self, pw: &str) -> [u8; 32] {
-        sha256_cat(&[pw.as_bytes(), &self.k.to_be_bytes()])
+    fn prk(&self, pw: &str) -> Zeroizing<[u8; 32]> {
+        Zeroizing::new(sha256_cat(&[pw.as_bytes(), &self.k.to_be_bytes()]))
     }
+
+    /// Home plane via unbiased rejection sampling over a SHAKE stream.
     fn home(&self, prk: &[u8; 32]) -> u64 {
-        let h = shake(&[prk, b"home"], 8);
-        u64::from_be_bytes(h.try_into().unwrap()) % self.k
+        let mut h = Shake256::default();
+        h.update(prk);
+        h.update(b"home");
+        let mut reader = h.finalize_xof();
+        let zone = (u64::MAX / self.k) * self.k;
+        let mut buf = [0u8; 8];
+        loop {
+            reader.read(&mut buf);
+            let x = u64::from_be_bytes(buf);
+            if x < zone {
+                return x % self.k;
+            }
+        }
     }
     fn smask(&self, prk: &[u8; 32]) -> Vec<u8> {
         shake(&[prk, b"saltmask"], S_BITS / 8)
     }
 
-    /// `count` distinct slot indices in [0, M_p), SHAKE-driven with rejection sampling.
-    fn slot_seq(&self, prk: &[u8; 32], plane: u64, count: usize) -> Vec<u64> {
-        let m = self.plane_slots(plane);
-        let mut h = Shake256::default();
-        h.update(prk);
-        h.update(b"slots");
-        h.update(&plane.to_be_bytes());
-        let mut reader = h.finalize_xof();
-
-        let zone = (u64::MAX / m) * m; // unbiased rejection threshold
-        let mut seen = HashSet::with_capacity(count * 2);
-        let mut out = Vec::with_capacity(count);
-        let mut buf = [0u8; 8];
-        while out.len() < count {
-            reader.read(&mut buf);
-            let x = u64::from_be_bytes(buf);
-            if x >= zone {
-                continue;
-            }
-            let v = x % m;
-            if seen.insert(v) {
-                out.push(v);
-            }
-        }
-        out
-    }
-
     // ---- read side ----
-    fn locate(&self, pw: &str, maxprobe: usize) -> Option<(u64, Vec<u8>)> {
+    fn locate(&self, pw: &str, maxprobe: usize) -> Option<(u64, Zeroizing<Vec<u8>>)> {
         let prk = self.prk(pw);
         let home = self.home(&prk);
         let smask = self.smask(&prk);
@@ -249,50 +340,58 @@ impl Kpdc {
             if (HEAD_BITS as u64) > self.plane_slots(plane) {
                 continue;
             }
-            let seq = self.slot_seq(&prk, plane, HEAD_BITS);
+            let mut walk = SlotWalk::new(&prk, plane, self.plane_slots(plane));
+            walk.ensure(HEAD_BITS);
             let head: Vec<u8> = (0..HEAD_BITS)
-                .map(|j| self.get_bit(self.global(seq[j], plane)))
+                .map(|j| self.get_bit(self.global(walk.out[j], plane)))
                 .collect();
 
             let salt = xor(&bits_to_bytes(&head[0..S_BITS]), &smask);
-            let mk = scrypt_kdf(pw.as_bytes(), self.k, &salt);
+            let mk = match argon2_kdf(pw.as_bytes(), self.k, &salt, self.kdf) {
+                Ok(mk) => mk,
+                Err(_) => return None,
+            };
 
-            let token = shake(&[&mk, b"token"], T_BITS / 8);
+            let token = shake(&[&*mk, b"token"], T_BITS / 8);
             let stored_token = bits_to_bytes(&head[S_BITS..S_BITS + T_BITS]);
-            if token != stored_token {
-                continue; // fast reject
+            if !ct_eq(&token, &stored_token) {
+                continue; // fast reject (constant-time)
             }
 
-            let lenmask = shake(&[&mk, b"len"], LEN_BITS / 8);
+            let lenmask = shake(&[&*mk, b"len"], LEN_BITS / 8);
             let len_field = bits_to_bytes(&head[S_BITS + T_BITS..HEAD_BITS]);
-            let l = u32::from_be_bytes(xor(&len_field, &lenmask).try_into().unwrap()) as usize;
+            let l = u32::from_be_bytes(xor(&len_field, &lenmask).try_into().unwrap()) as u64;
 
-            let total = HEAD_BITS + 8 * l + TAG_BITS;
-            if (total as u64) > self.plane_slots(plane) {
+            // u64 math avoids overflow on 32-bit targets; bound-check before use.
+            let total = HEAD_BITS as u64 + 8 * l + TAG_BITS as u64;
+            if total > self.plane_slots(plane) {
                 continue;
             }
-            let seq = self.slot_seq(&prk, plane, total);
+            let total = total as usize;
+            let l = l as usize;
+            walk.ensure(total);
             let ct_bits: Vec<u8> = (HEAD_BITS..HEAD_BITS + 8 * l)
-                .map(|j| self.get_bit(self.global(seq[j], plane)))
+                .map(|j| self.get_bit(self.global(walk.out[j], plane)))
                 .collect();
             let tag_bits: Vec<u8> = (HEAD_BITS + 8 * l..total)
-                .map(|j| self.get_bit(self.global(seq[j], plane)))
+                .map(|j| self.get_bit(self.global(walk.out[j], plane)))
                 .collect();
             let ct = bits_to_bytes(&ct_bits);
             let tag = bits_to_bytes(&tag_bits);
 
-            let mackey = shake(&[&mk, b"mac"], 32);
-            if hmac_sha256(&mackey, &ct).as_slice() != tag.as_slice() {
+            let mackey = Zeroizing::new(shake(&[&*mk, b"mac"], 32));
+            if !ct_eq(&hmac_sha256(&mackey, &ct), &tag) {
                 continue; // tampered or rare false token match
             }
-            let stream = shake(&[&mk, b"stream"], l);
-            return Some((plane, xor(&ct, &stream)));
+            let stream = Zeroizing::new(shake(&[&*mk, b"stream"], l));
+            return Some((plane, Zeroizing::new(xor(&ct, &stream))));
         }
         None
     }
 
     /// Decrypt the payload for `pw`, or `None` (wrong credential / not present).
-    pub fn read(&self, pw: &str, maxprobe: usize) -> Option<Vec<u8>> {
+    /// The returned plaintext is zeroized on drop.
+    pub fn read(&self, pw: &str, maxprobe: usize) -> Option<Zeroizing<Vec<u8>>> {
         self.locate(pw, maxprobe).map(|(_, pt)| pt)
     }
 
@@ -313,6 +412,9 @@ impl Kpdc {
         maxprobe: usize,
         salt: Option<&[u8]>,
     ) -> Result<u64, Error> {
+        if plaintext.len() as u64 > u32::MAX as u64 {
+            return Err(Error::PayloadTooLong { len: plaintext.len() });
+        }
         let prk = self.prk(pw);
         let home = self.home(&prk);
 
@@ -353,11 +455,11 @@ impl Kpdc {
         };
 
         let smask = self.smask(&prk);
-        let mk = scrypt_kdf(pw.as_bytes(), self.k, &salt);
-        let token = shake(&[&mk, b"token"], T_BITS / 8);
-        let lenmask = shake(&[&mk, b"len"], LEN_BITS / 8);
-        let stream = shake(&[&mk, b"stream"], plaintext.len());
-        let mackey = shake(&[&mk, b"mac"], 32);
+        let mk = argon2_kdf(pw.as_bytes(), self.k, &salt, self.kdf)?;
+        let token = shake(&[&*mk, b"token"], T_BITS / 8);
+        let lenmask = shake(&[&*mk, b"len"], LEN_BITS / 8);
+        let stream = Zeroizing::new(shake(&[&*mk, b"stream"], plaintext.len()));
+        let mackey = Zeroizing::new(shake(&[&*mk, b"mac"], 32));
 
         let ct = xor(plaintext, &stream);
         let tag = hmac_sha256(&mackey, &ct);
@@ -371,9 +473,10 @@ impl Kpdc {
         bits.extend(bytes_to_bits(&ct));
         bits.extend(bytes_to_bits(&tag));
 
-        let seq = self.slot_seq(&prk, plane, bits.len());
+        let mut walk = SlotWalk::new(&prk, plane, self.plane_slots(plane));
+        walk.ensure(bits.len());
         for (j, &bit) in bits.iter().enumerate() {
-            let g = self.global(seq[j], plane);
+            let g = self.global(walk.out[j], plane);
             self.set_bit(g, bit);
         }
         Ok(plane)
@@ -384,37 +487,57 @@ impl Kpdc {
 mod tests {
     use super::*;
 
+    const TP: KdfParams = KdfParams::FAST_TEST;
+
     #[test]
     fn next_prime_coprime8_works() {
         assert_eq!(next_prime_coprime8(419), 419);
         assert_eq!(next_prime_coprime8(420), 421);
         assert_eq!(next_prime_coprime8(2), 3);
+        assert!(is_recommended_k(419));
+        assert!(!is_recommended_k(8));
+        assert!(!is_recommended_k(2));
+    }
+
+    #[test]
+    fn invalid_k_is_rejected_not_panic() {
+        assert!(matches!(Kpdc::create(1024, 0, TP), Err(Error::InvalidK { .. })));
+        assert!(matches!(Kpdc::create(1024, 1, TP), Err(Error::InvalidK { .. })));
+        // K larger than the bit-count is also rejected (would underflow plane math)
+        assert!(matches!(Kpdc::create(2, 100, TP), Err(Error::InvalidK { .. })));
     }
 
     #[test]
     fn roundtrip_two_payloads() {
         let k = next_prime_coprime8(419);
-        let mut c = Kpdc::create(65536, k).unwrap();
+        let mut c = Kpdc::create(65536, k, TP).unwrap();
         let pa = c.write("alpha-pass", b"the treaty is signed at dawn", &[], DEFAULT_MAXPROBE, None).unwrap();
         let pb = c.write("beta-pass", b"pier 39, midnight", &["alpha-pass"], DEFAULT_MAXPROBE, None).unwrap();
         assert_ne!(pa, pb);
-        assert_eq!(c.read("alpha-pass", DEFAULT_MAXPROBE).as_deref(), Some(&b"the treaty is signed at dawn"[..]));
-        assert_eq!(c.read("beta-pass", DEFAULT_MAXPROBE).as_deref(), Some(&b"pier 39, midnight"[..]));
-        assert_eq!(c.read("wrong-pass", DEFAULT_MAXPROBE), None);
+        assert_eq!(c.read("alpha-pass", DEFAULT_MAXPROBE).map(|z| z.to_vec()), Some(b"the treaty is signed at dawn".to_vec()));
+        assert_eq!(c.read("beta-pass", DEFAULT_MAXPROBE).map(|z| z.to_vec()), Some(b"pier 39, midnight".to_vec()));
+        assert!(c.read("wrong-pass", DEFAULT_MAXPROBE).is_none());
+    }
+
+    #[test]
+    fn empty_payload_roundtrips() {
+        let k = next_prime_coprime8(101);
+        let mut c = Kpdc::create(16384, k, TP).unwrap();
+        c.write("pw", b"", &[], DEFAULT_MAXPROBE, None).unwrap();
+        assert_eq!(c.read("pw", DEFAULT_MAXPROBE).map(|z| z.to_vec()), Some(Vec::new()));
     }
 
     #[test]
     fn tamper_is_detected() {
         let k = next_prime_coprime8(257);
-        let mut c = Kpdc::create(32768, k).unwrap();
+        let mut c = Kpdc::create(32768, k, TP).unwrap();
         c.write("pw", b"secret message here", &[], DEFAULT_MAXPROBE, None).unwrap();
-        // flip a byte: HMAC should reject -> None (no panic, no garbage)
         let mut bytes = c.into_bytes();
         bytes[12345] ^= 0xFF;
-        let c2 = Kpdc::from_bytes(bytes, k);
-        // either still reads (if flip missed this plane) or returns None — never wrong plaintext
+        let c2 = Kpdc::from_bytes(bytes, k, TP).unwrap();
+        // either still reads (if flip missed this plane) or None — never wrong plaintext
         match c2.read("pw", DEFAULT_MAXPROBE) {
-            Some(pt) => assert_eq!(pt, b"secret message here"),
+            Some(pt) => assert_eq!(pt.as_slice(), b"secret message here"),
             None => {}
         }
     }

@@ -82,8 +82,10 @@ entire layout and all keys wrong.
 Number the block's bits `0 .. 8B-1`. **Plane `k` = every bit-index `i` with `i mod K = k`.**
 There are `K` disjoint planes; plane `k` has `floor or ceil(8B/K)` slots.
 
-Because `gcd(K, 8) = 1`, consecutive slots of a plane fall on *different bit-positions*
-within their bytes — each plane is a diagonal through the byte grid, not a fixed bit-layer.
+Because `gcd(K, 8) = 1`, a plane's slots (the residue class `g ≡ k mod K`) are spread
+across *all* bit-positions within their bytes rather than pinned to one — the de-alignment
+comes from the residue-class mapping itself, independent of the order the intra-plane walk
+visits them. (If `K` shared a factor with 8, planes would collapse toward fixed bit-layers.)
 This removes byte-grid alignment and whitens layout. (If `K` shared a factor with 8, planes
 would collapse toward fixed bit-positions — avoid.)
 
@@ -102,7 +104,7 @@ Slot `t` of plane `k` is global bit-index `g = t*K + k`; that is byte `g div 8`,
 | `Lf`   | length field (bits) | 32 |
 | `maxprobe` | open-addressing probe bound | e.g., 64 (>= expected cluster) |
 | KDF    | memory-hard password KDF | Argon2id (t=3, m=64MiB, p=1) |
-| PRF/XOF| derivation + keystream | HKDF-SHA256 / SHAKE256 |
+| PRF/XOF| derivation + keystream | SHAKE256 (keyed by prefix) |
 
 A payload occupies `S + T + Lf + 8*len` bits along its plane-walk; must be <= plane size.
 
@@ -125,9 +127,15 @@ stream  = HKDF(mk, "stream", 8*len)
 mackey  = HKDF(mk, "mac")              # integrity over the ciphertext (A3)
 ```
 
-Intra-plane scatter visits plane-slot indices `slot(j) = (start + j*stride) mod M`
-(M prime => full period). Constraint-free alternative: a keyed PRP over `[0, M)`
-(small-domain Feistel / cycle-walking) — recommended if you don't want to size planes prime.
+**Notation:** `HKDF(key, label, n)` above denotes a keyed PRF/XOF. The reference
+implementations realize it directly as `SHAKE256(key || label)` (the pinned XOF, §12),
+not RFC-5869 HKDF — for a XOF this needs no extract/expand step.
+
+Intra-plane scatter visits a sequence of distinct plane-slot indices in `[0, M)`. Two
+realizations: (a) a linear stride walk `slot(j) = (start + j*stride) mod M` with `M`
+prime (full period); or (b) **a SHAKE-driven distinct-slot scatter with rejection
+sampling** — what `kpdc_reference.py` and the Rust `azoth` crate actually use, since it
+needs no primality constraint on `M` and has no modulo bias.
 
 ---
 
@@ -182,8 +190,9 @@ for p in (home, home+1, ..., home+maxprobe-1) mod K:
         return ct ^ HKDF(mk,"stream",8*len)
 return NONE
 ```
-Legit reads terminate in ~`1/(1-loadfactor)` probes (cheap). A wrong credential probes the
-full `maxprobe` and fails — deliberately expensive, raising brute-force cost.
+Legit reads terminate in ~`1/(1-loadfactor)` probes (cheap). A wrong credential probes up to
+`min(maxprobe, K)` planes (only `K` distinct planes exist) and fails — the per-attempt KDF
+cost is what raises brute-force cost.
 
 ---
 
