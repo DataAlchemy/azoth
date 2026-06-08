@@ -1,47 +1,103 @@
-# azoth — K-Plane Deniable Container (KPDC)
+<div align="center">
+
+# ⚗️ azoth
+
+### one block of noise · many secrets · provably nothing there
+
+![status](https://img.shields.io/badge/status-experimental-orange)
+![not audited](https://img.shields.io/badge/security-NOT%20audited-red)
+![deniable](https://img.shields.io/badge/property-deniable-blueviolet)
+![planes](https://img.shields.io/badge/payloads-up%20to%20K-success)
 
 > *Azoth* — the alchemists' hidden universal essence, the secret agent of transmutation.
+> Here it's a container that turns a block of pure randomness into as many secrets as you like.
 
-A deniable encryption container: a fixed-size block of random-looking bytes that holds
-up to **K** independent encrypted payloads. Without the correct `(password, K)` the block
-is computationally indistinguishable from random data — there is no stored header, index,
-or count, and no party (including the owner) can prove how many payloads it contains.
+</div>
 
-Different passwords decrypt to completely different plaintexts from the same block.
+---
 
-## Contents
+```
+        ┌─────────────────────────────────────────────────────────────┐
+   disk │  9f a3 0c e7 5b 11 c4 8d 2a f0 71 b9 …  (looks like /dev/urandom)
+        └─────────────────────────────────────────────────────────────┘
+                 ▲                ▲                ▲
+            password A       password B       password C?  …or nothing?
+                 │                │                  (you can't prove it either way)
+          "evac at dawn"   "harmless decoy"
+                 └── same bytes ──┴── different truths ──┘
+```
 
-- **[`_bmad-output/brainstorming/8pdc-spec-draft.md`](_bmad-output/brainstorming/8pdc-spec-draft.md)**
-  — the design spec (v0.3), including the threat model, algorithms, and an honest
-  weaknesses section from an adversarial review.
-- **[`_bmad-output/brainstorming/brainstorming-session-2026-06-06.md`](_bmad-output/brainstorming/brainstorming-session-2026-06-06.md)**
-  — the brainstorming session log that produced the design (14 building blocks + adversarial pass).
-- **[`kpdc_reference.py`](kpdc_reference.py)** — a dependency-free (Python stdlib) reference
-  implementation. Run `python3 kpdc_reference.py` for a self-test.
+**azoth** is a deniable-encryption container. A fixed-size block of random-looking bytes
+holds **up to `K` independent encrypted payloads**. Without the right `(password, K)` the
+block is computationally **indistinguishable from random data** — no header, no index, no
+count — and **no one, not even the owner, can prove how many secrets are inside.** Two
+different passwords decrypt two completely different plaintexts from the very same block.
 
-## The four properties
+---
 
-1. **Oversized** — block ≥ ~10× total payload; plane size (`8B/K`) is the per-item cap.
-2. **Multi-payload** — up to `K` independent payloads, one per disjoint "plane".
-3. **Indistinguishable** — empty and full blocks are byte-statistically identical.
-4. **Multi-key** — each password yields its own plaintext; wrong credential → noise.
+## ✦ What makes it different
 
-## How it works (one paragraph)
+| Property | What it means |
+|---|---|
+| 🜂 **Indistinguishable** | An empty block and a full one are byte-for-byte statistically identical. There is nothing to find. |
+| 🜄 **Many-in-one** | Up to `K` payloads share one block, each on its own disjoint "plane." Set `K` as high as you want. |
+| 🜁 **Plausibly deniable** | Reveal one password under pressure; the existence of the others stays mathematically unprovable. |
+| 🜃 **No verifier** | The container never confirms a password. A wrong guess just yields more noise — no oracle, no tell. |
 
-The block's bits are partitioned into `K` disjoint **planes** (bit-index ≡ k mod K, with K
-prime and coprime to 8 so planes cut diagonally across the byte grid). Each payload is
-AEAD-style encrypted under a key derived from `(password, K)` via a memory-hard KDF, then
-its bits are scattered along a SHAKE-driven walk **within one plane**. A password hashes to
-a home plane and is found by open-addressed probing; recognition is a per-write token +
-HMAC tag, both invisible without the key. Empty slots stay as the original random fill.
+## ✦ The trick, in one breath
 
-## Status & scope
+The block's bits are sliced into `K` disjoint **planes** (bit-index ≡ k mod `K`, with `K`
+prime and coprime to 8 so the planes cut diagonally across the byte grid). Each payload is
+encrypted under a key derived from `(password, K)` via a memory-hard KDF, then its bits are
+**scattered along a pseudo-random walk inside one plane**. A password hashes to a home plane
+and is found by open-addressed probing; a per-write token + HMAC tag confirm the read — both
+invisible without the key. Unused slots keep their original randomness. *Empty looks like full
+looks like noise.*
 
-Brainstorm output, **not security-audited**. v1 targets deniability against a single-look
-inspector; multi-snapshot diffing is a known gap deferred to a V2 whole-block re-randomize
-mode (see spec §4 and §11). The reference implementation is for clarity, not production
-(see header notes: modulo bias in slot selection, low scrypt cost, etc.).
+## ✦ Try it
 
-## Pinned primitives
+```bash
+python3 kpdc_reference.py     # self-test: 2 secrets, 2 passwords, 1 indistinguishable block
+```
 
-scrypt (memory-hard KDF) · SHAKE256 (XOF/PRF) · SHA-256 (fast hash) · HMAC-SHA256 (integrity).
+```python
+from kpdc_reference import KPDC, next_prime_coprime8
+
+K  = next_prime_coprime8(419)
+c  = KPDC.create(65536, K)                       # 64 KiB of pure randomness
+c.write("correct horse battery staple", b"the treaty is signed at dawn")
+c.write("hunter2-xK!",                  b"meet at pier 39, midnight",
+        known_pws=["correct horse battery staple"])
+
+c.read("correct horse battery staple")   # -> b"the treaty is signed at dawn"
+c.read("hunter2-xK!")                     # -> b"meet at pier 39, midnight"
+c.read("wrong password")                  # -> None  (just noise)
+```
+
+## ✦ Map of the repo
+
+| Path | What |
+|---|---|
+| [`_bmad-output/.../8pdc-spec-draft.md`](_bmad-output/brainstorming/8pdc-spec-draft.md) | **The design spec (v0.3)** — threat model, algorithms, honest weaknesses from an adversarial review. |
+| [`_bmad-output/.../brainstorming-session-2026-06-06.md`](_bmad-output/brainstorming/brainstorming-session-2026-06-06.md) | The brainstorming log that produced the design (14 building blocks → adversarial pass). |
+| [`kpdc_reference.py`](kpdc_reference.py) | A dependency-free **readable reference** (Python stdlib). Clarity over speed — a fast port is planned. |
+
+## ✦ Pinned primitives
+
+**scrypt** (memory-hard KDF) · **SHAKE256** (XOF/PRF) · **SHA-256** (fast hash) · **HMAC-SHA256** (integrity).
+
+## ⚠ Status & honest scope
+
+Brainstorm output — **experimental, not security-audited. Do not protect anything real with it yet.**
+v1 targets deniability against a *single-look* inspector; multi-snapshot diffing (imaging the block
+before & after a write) is a known gap deferred to a V2 *whole-block re-randomize* mode — see spec
+§4 and §11. The reference is for clarity, not production (modulo-biased slot selection, low KDF cost).
+
+And remember: azoth hides *what* and *how much*, not *that a high-entropy blob exists* — pair it
+with a plausible cover (disk free space, a "wiped" partition, or a benign decoy payload).
+
+<div align="center">
+
+*solve et coagula*
+
+</div>
