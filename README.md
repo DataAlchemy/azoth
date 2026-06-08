@@ -54,33 +54,49 @@ and is found by open-addressed probing; a per-write token + HMAC tag confirm the
 invisible without the key. Unused slots keep their original randomness. *Empty looks like full
 looks like noise.*
 
-## ✦ Try it
+## ✦ Try it (Rust — the real implementation)
 
 ```bash
-python3 kpdc_reference.py     # self-test: 2 secrets, 2 passwords, 1 indistinguishable block
+cd azoth && cargo build --release
+BIN=./target/release/azoth
+
+K=$($BIN prime 419)                                   # a good K: prime, coprime to 8
+$BIN create --size 65536 --k $K --out vault.bin       # 64 KiB of pure randomness
+
+printf 'the treaty is signed at dawn' | $BIN write --file vault.bin --k $K --password alice --data -
+printf 'meet at pier 39, midnight'    | $BIN write --file vault.bin --k $K --password bob   --data - --known alice
+
+$BIN read --file vault.bin --k $K --password alice     # -> the treaty is signed at dawn
+$BIN read --file vault.bin --k $K --password bob       # -> meet at pier 39, midnight
+$BIN read --file vault.bin --k $K --password mallory   # -> error: just noise
 ```
 
-```python
-from kpdc_reference import KPDC, next_prime_coprime8
+As a library:
 
-K  = next_prime_coprime8(419)
-c  = KPDC.create(65536, K)                       # 64 KiB of pure randomness
-c.write("correct horse battery staple", b"the treaty is signed at dawn")
-c.write("hunter2-xK!",                  b"meet at pier 39, midnight",
-        known_pws=["correct horse battery staple"])
+```rust
+use azoth::{Kpdc, next_prime_coprime8, DEFAULT_MAXPROBE};
 
-c.read("correct horse battery staple")   # -> b"the treaty is signed at dawn"
-c.read("hunter2-xK!")                     # -> b"meet at pier 39, midnight"
-c.read("wrong password")                  # -> None  (just noise)
+let k = next_prime_coprime8(419);
+let mut c = Kpdc::create(65536, k)?;                          // 64 KiB of randomness
+c.write("alice", b"the treaty is signed at dawn", &[], DEFAULT_MAXPROBE, None)?;
+c.write("bob",   b"meet at pier 39, midnight", &["alice"], DEFAULT_MAXPROBE, None)?;
+
+c.read("alice", DEFAULT_MAXPROBE);   // Some(b"the treaty is signed at dawn")
+c.read("bob",   DEFAULT_MAXPROBE);   // Some(b"meet at pier 39, midnight")
+c.read("mallory", DEFAULT_MAXPROBE); // None  (just noise)
 ```
+
+The **Python reference** (`kpdc_reference.py`) mirrors this for readability — run
+`python3 kpdc_reference.py` for the same self-test.
 
 ## ✦ Map of the repo
 
 | Path | What |
 |---|---|
+| [`azoth/`](azoth/) | **The Rust implementation** — `azoth` library crate + CLI (`create`/`write`/`read`). The real, fast one. |
+| [`kpdc_reference.py`](kpdc_reference.py) | The **readable reference** (Python stdlib, no deps). Clarity over speed; mirrors the spec. |
 | [`_bmad-output/.../8pdc-spec-draft.md`](_bmad-output/brainstorming/8pdc-spec-draft.md) | **The design spec (v0.3)** — threat model, algorithms, honest weaknesses from an adversarial review. |
 | [`_bmad-output/.../brainstorming-session-2026-06-06.md`](_bmad-output/brainstorming/brainstorming-session-2026-06-06.md) | The brainstorming log that produced the design (14 building blocks → adversarial pass). |
-| [`kpdc_reference.py`](kpdc_reference.py) | A dependency-free **readable reference** (Python stdlib). Clarity over speed — a fast port is planned. |
 
 ## ✦ Pinned primitives
 
@@ -91,7 +107,9 @@ c.read("wrong password")                  # -> None  (just noise)
 Brainstorm output — **experimental, not security-audited. Do not protect anything real with it yet.**
 v1 targets deniability against a *single-look* inspector; multi-snapshot diffing (imaging the block
 before & after a write) is a known gap deferred to a V2 *whole-block re-randomize* mode — see spec
-§4 and §11. The reference is for clarity, not production (modulo-biased slot selection, low KDF cost).
+§4 and §11. The Rust crate uses rejection sampling (no modulo bias) but still ships low KDF cost
+and non-constant-time probing — tune before any real use. The Python reference favors clarity over
+all of the above.
 
 And remember: azoth hides *what* and *how much*, not *that a high-entropy blob exists* — pair it
 with a plausible cover (disk free space, a "wiped" partition, or a benign decoy payload).
