@@ -1,0 +1,7 @@
+# Local machine-specific Claude Code config (permissions/env) — not source or planning
+.claude/settings.local.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
