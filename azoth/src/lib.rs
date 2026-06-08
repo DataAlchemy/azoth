@@ -72,6 +72,7 @@ pub enum Error {
     ContainerFull,
     PayloadTooLarge { need_bits: u64, plane_bits: u64 },
     PayloadTooLong { len: usize },
+    BadSaltLen { got: usize, expected: usize },
     Rng,
     Kdf,
 }
@@ -92,6 +93,9 @@ impl std::fmt::Display for Error {
             ),
             Error::PayloadTooLong { len } => {
                 write!(f, "payload length {} exceeds u32 length field (max ~4 GiB)", len)
+            }
+            Error::BadSaltLen { got, expected } => {
+                write!(f, "salt must be exactly {} bytes, got {}", expected, got)
             }
             Error::Rng => write!(f, "failed to gather randomness"),
             Error::Kdf => write!(f, "KDF (Argon2id) failure — check parameters"),
@@ -459,6 +463,9 @@ impl Kpdc {
 
         let mut salt_buf = [0u8; S_BITS / 8];
         let salt = match salt {
+            Some(s) if s.len() != S_BITS / 8 => {
+                return Err(Error::BadSaltLen { got: s.len(), expected: S_BITS / 8 })
+            }
             Some(s) => s.to_vec(),
             None => {
                 getrandom::getrandom(&mut salt_buf).map_err(|_| Error::Rng)?;
@@ -551,6 +558,18 @@ mod tests {
         if let Some(pt) = c2.read("pw", DEFAULT_MAXPROBE) {
             assert_eq!(pt.as_slice(), b"secret message here");
         }
+    }
+
+    #[test]
+    fn wrong_salt_length_is_rejected() {
+        let k = next_prime_coprime8(101);
+        let mut c = Kpdc::create(16384, k, TP).unwrap();
+        assert!(matches!(
+            c.write("pw", b"hi", &[], DEFAULT_MAXPROBE, Some(&[0u8; 8])),
+            Err(Error::BadSaltLen { .. })
+        ));
+        // exactly 16 bytes is accepted
+        assert!(c.write("pw", b"hi", &[], DEFAULT_MAXPROBE, Some(&[0u8; 16])).is_ok());
     }
 
     #[test]
