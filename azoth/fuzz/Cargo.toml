@@ -1,0 +1,23 @@
+[package]
+name = "azoth-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+azoth = { path = ".." }
+
+# Prevent this from being picked up by the parent crate's builds.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "read_arbitrary"
+path = "fuzz_targets/read_arbitrary.rs"
+test = false
+doc = false
+bench = false

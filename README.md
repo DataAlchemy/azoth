@@ -2,8 +2,10 @@
 
 # ⚗️ azoth
 
-### one block of noise · many secrets · provably nothing there
+### one block of noise · many secrets · nothing to find without the key
 
+![CI](https://github.com/DataAlchemy/azoth/actions/workflows/ci.yml/badge.svg)
+![license](https://img.shields.io/badge/license-MIT-blue)
 ![status](https://img.shields.io/badge/status-experimental-orange)
 ![not audited](https://img.shields.io/badge/security-NOT%20audited-red)
 ![deniable](https://img.shields.io/badge/property-deniable-blueviolet)
@@ -41,7 +43,7 @@ different passwords decrypt two completely different plaintexts from the very sa
 |---|---|
 | 🜂 **Indistinguishable** | An empty block and a full one are byte-for-byte statistically identical. There is nothing to find. |
 | 🜄 **Many-in-one** | Up to `K` payloads share one block, each on its own disjoint "plane." Set `K` as high as you want. |
-| 🜁 **Plausibly deniable** | Reveal one password under pressure; the existence of the others stays mathematically unprovable. |
+| 🜁 **Plausibly deniable** | Reveal one password under pressure; against an inspector without the others, their existence stays computationally deniable. |
 | 🜃 **No verifier** | The container never confirms a password. A wrong guess just yields more noise — no oracle, no tell. |
 
 ## ✦ The trick, in one breath
@@ -63,8 +65,10 @@ BIN=./target/release/azoth
 K=$($BIN prime 419)                                   # a good K: prime, coprime to 8
 $BIN create --size 65536 --k $K --out vault.bin       # 64 KiB of pure randomness
 
-printf 'the treaty is signed at dawn' | $BIN write --file vault.bin --k $K --password alice --data -
-printf 'meet at pier 39, midnight'    | $BIN write --file vault.bin --k $K --password bob   --data - --known alice
+# Each write re-randomizes the WHOLE block (multi-snapshot safe) and so requires
+# every existing password via --known, plus --all-keys to confirm.
+printf 'the treaty is signed at dawn' | $BIN write --file vault.bin --k $K --password alice --data - --all-keys
+printf 'meet at pier 39, midnight'    | $BIN write --file vault.bin --k $K --password bob   --data - --known alice --all-keys
 
 $BIN read --file vault.bin --k $K --password alice     # -> the treaty is signed at dawn
 $BIN read --file vault.bin --k $K --password bob       # -> meet at pier 39, midnight
@@ -74,21 +78,28 @@ $BIN read --file vault.bin --k $K --password mallory   # -> error: just noise
 As a library:
 
 ```rust
-use azoth::{Kpdc, KdfParams, next_prime_coprime8, DEFAULT_MAXPROBE};
+use azoth::{Kpdc, KdfParams, next_prime_coprime8};
 
 let k = next_prime_coprime8(419);
 let mut c = Kpdc::create(65536, k, KdfParams::default())?;    // 64 KiB of randomness
-c.write("alice", b"the treaty is signed at dawn", &[], DEFAULT_MAXPROBE, None)?;
-c.write("bob",   b"meet at pier 39, midnight", &["alice"], DEFAULT_MAXPROBE, None)?;
+// Whole-block re-randomize: rebuild from ALL payloads (anything omitted is destroyed).
+c.write_all_fresh(&[
+    ("alice", b"the treaty is signed at dawn"),
+    ("bob",   b"meet at pier 39, midnight"),
+], 64)?;
 
-c.read("alice", DEFAULT_MAXPROBE);   // Some(b"the treaty is signed at dawn")
-c.read("bob",   DEFAULT_MAXPROBE);   // Some(b"meet at pier 39, midnight")
-c.read("mallory", DEFAULT_MAXPROBE); // None  (just noise)
+c.read("alice", 64);   // Some(b"the treaty is signed at dawn")
+c.read("bob",   64);   // Some(b"meet at pier 39, midnight")
+c.read("mallory", 64); // None  (just noise)
+// (Kpdc::write(...) still exists for an in-place, non-re-randomizing write.)
 ```
 
-> Omit `--password` and azoth prompts for it without echo — preferred, since
-> passwords in CLI args leak via `ps` and shell history. The KDF cost (`--kdf-mem-mib`,
-> `--kdf-iters`) is part of the credential: read and write must use the same values.
+> **Operational notes.** Omit `--password` and azoth prompts without echo — preferred,
+> since CLI args leak via `ps`/history. The **KDF cost** (`--kdf-mem-mib`/`--kdf-iters`,
+> default Argon2id **256 MiB / 3 passes**) is part of the credential and is **not stored**:
+> if you change it you must remember the exact values to decrypt, or the data is lost.
+> Re-randomize is **on by default**; use `--no-rerandomize` for a faster in-place write
+> that leaves a multi-snapshot diffing fingerprint.
 
 The **Python reference** (`kpdc_reference.py`) mirrors this for readability — run
 `python3 kpdc_reference.py` for the same self-test. **Note:** the Python and Rust

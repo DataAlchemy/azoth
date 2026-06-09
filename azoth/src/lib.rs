@@ -54,15 +54,25 @@ pub struct KdfParams {
 }
 
 impl KdfParams {
-    /// Sensible default for real use (~64 MiB, 3 passes).
-    pub const INTERACTIVE: KdfParams = KdfParams { mem_kib: 65_536, iters: 3, lanes: 1 };
-    /// Low cost for tests/CI only — NOT for protecting real data.
-    pub const FAST_TEST: KdfParams = KdfParams { mem_kib: 8_192, iters: 1, lanes: 1 };
+    /// Recommended production cost (256 MiB, 3 passes). The default. Deliberately
+    /// heavy to make offline brute force of the verification oracle impractical.
+    pub const RECOMMENDED: KdfParams = KdfParams {
+        mem_kib: 262_144,
+        iters: 3,
+        lanes: 1,
+    };
+    /// Low cost for high-volume statistical/fuzz tests ONLY (output distribution and
+    /// panic-safety are independent of KDF cost). Never use for real data.
+    pub const FAST_TEST: KdfParams = KdfParams {
+        mem_kib: 8_192,
+        iters: 1,
+        lanes: 1,
+    };
 }
 
 impl Default for KdfParams {
     fn default() -> Self {
-        KdfParams::INTERACTIVE
+        KdfParams::RECOMMENDED
     }
 }
 
@@ -86,13 +96,20 @@ impl std::fmt::Display for Error {
                 k, nbits
             ),
             Error::ContainerFull => write!(f, "container full: no free plane within probe bound"),
-            Error::PayloadTooLarge { need_bits, plane_bits } => write!(
+            Error::PayloadTooLarge {
+                need_bits,
+                plane_bits,
+            } => write!(
                 f,
                 "payload too large: needs {} bits but plane holds {} (raise block size or lower K)",
                 need_bits, plane_bits
             ),
             Error::PayloadTooLong { len } => {
-                write!(f, "payload length {} exceeds u32 length field (max ~4 GiB)", len)
+                write!(
+                    f,
+                    "payload length {} exceeds u32 length field (max ~4 GiB)",
+                    len
+                )
             }
             Error::BadSaltLen { got, expected } => {
                 write!(f, "salt must be exactly {} bytes, got {}", expected, got)
@@ -134,7 +151,9 @@ fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
 /// Validate KDF params up front so `argon2_kdf` can't fail mid-read (which would
 /// otherwise be indistinguishable from a wrong password).
 fn validate_kdf(p: KdfParams) -> Result<(), Error> {
-    Params::new(p.mem_kib, p.iters, p.lanes, Some(32)).map(|_| ()).map_err(|_| Error::Kdf)
+    Params::new(p.mem_kib, p.iters, p.lanes, Some(32))
+        .map(|_| ())
+        .map_err(|_| Error::Kdf)
 }
 
 /// Argon2id over `pw || K_be64` with the given cost. Output is zeroized on drop.
@@ -143,10 +162,12 @@ fn argon2_kdf(pw: &[u8], k: u64, salt: &[u8], p: KdfParams) -> Zeroizing<[u8; 32
     let mut input = Zeroizing::new(Vec::with_capacity(pw.len() + 8));
     input.extend_from_slice(pw);
     input.extend_from_slice(&k.to_be_bytes());
-    let params = Params::new(p.mem_kib, p.iters, p.lanes, Some(32)).expect("KDF params validated at construction");
+    let params = Params::new(p.mem_kib, p.iters, p.lanes, Some(32))
+        .expect("KDF params validated at construction");
     let a = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
     let mut out = Zeroizing::new([0u8; 32]);
-    a.hash_password_into(&input, salt, &mut *out).expect("argon2id hash");
+    a.hash_password_into(&input, salt, &mut *out)
+        .expect("argon2id hash");
     out
 }
 
@@ -427,7 +448,17 @@ impl Kpdc {
         salt: Option<&[u8]>,
     ) -> Result<u64, Error> {
         if plaintext.len() as u64 > u32::MAX as u64 {
-            return Err(Error::PayloadTooLong { len: plaintext.len() });
+            return Err(Error::PayloadTooLong {
+                len: plaintext.len(),
+            });
+        }
+        if let Some(s) = salt {
+            if s.len() != S_BITS / 8 {
+                return Err(Error::BadSaltLen {
+                    got: s.len(),
+                    expected: S_BITS / 8,
+                });
+            }
         }
         let prk = self.prk(pw);
 
@@ -458,15 +489,15 @@ impl Kpdc {
         let total = (HEAD_BITS + 8 * plaintext.len() + TAG_BITS) as u64;
         let cap = self.plane_slots(plane);
         if total > cap {
-            return Err(Error::PayloadTooLarge { need_bits: total, plane_bits: cap });
+            return Err(Error::PayloadTooLarge {
+                need_bits: total,
+                plane_bits: cap,
+            });
         }
 
         let mut salt_buf = [0u8; S_BITS / 8];
         let salt = match salt {
-            Some(s) if s.len() != S_BITS / 8 => {
-                return Err(Error::BadSaltLen { got: s.len(), expected: S_BITS / 8 })
-            }
-            Some(s) => s.to_vec(),
+            Some(s) => s.to_vec(), // length already validated above
             None => {
                 getrandom::getrandom(&mut salt_buf).map_err(|_| Error::Rng)?;
                 salt_buf.to_vec()
@@ -500,13 +531,50 @@ impl Kpdc {
         }
         Ok(plane)
     }
+
+    /// Re-randomize the **entire** container: discard the current block, fill a fresh
+    /// random one, and re-write every supplied payload with new salts. Because every
+    /// bit changes on every write, this defeats multi-snapshot diffing (an adversary
+    /// who images the block before and after cannot localize changes or learn `K`).
+    ///
+    /// You MUST pass every payload the container should retain — anything omitted is
+    /// permanently gone. The rebuild is atomic: on any error the original block is
+    /// left untouched.
+    pub fn write_all_fresh(
+        &mut self,
+        payloads: &[(&str, &[u8])],
+        maxprobe: usize,
+    ) -> Result<(), Error> {
+        let mut fresh = vec![0u8; self.block.len()];
+        getrandom::getrandom(&mut fresh).map_err(|_| Error::Rng)?;
+        let mut tmp = Kpdc {
+            block: fresh,
+            k: self.k,
+            kdf: self.kdf,
+        };
+        for i in 0..payloads.len() {
+            let (pw, pt) = payloads[i];
+            let known: Vec<&str> = payloads[..i].iter().map(|(p, _)| *p).collect();
+            tmp.write(pw, pt, &known, maxprobe, None)?; // tmp dropped on error -> self unchanged
+        }
+        self.block = tmp.block;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const TP: KdfParams = KdfParams::FAST_TEST;
+    // Headline functional tests run at the REAL recommended cost (small K/maxprobe
+    // keep the Argon2 call count low so they finish in a few seconds each).
+    const REC: KdfParams = KdfParams::RECOMMENDED;
+    // FAST_TEST is used only where a test needs many KDF evals and the property under
+    // test (logic/invariants) is independent of KDF cost.
+    const FAST: KdfParams = KdfParams::FAST_TEST;
+    const MP: usize = 2;
+    const K: u64 = 11;
+    const SZ: usize = 8192;
 
     #[test]
     fn next_prime_coprime8_works() {
@@ -520,67 +588,90 @@ mod tests {
 
     #[test]
     fn invalid_k_is_rejected_not_panic() {
-        assert!(matches!(Kpdc::create(1024, 0, TP), Err(Error::InvalidK { .. })));
-        assert!(matches!(Kpdc::create(1024, 1, TP), Err(Error::InvalidK { .. })));
+        assert!(matches!(
+            Kpdc::create(1024, 0, FAST),
+            Err(Error::InvalidK { .. })
+        ));
+        assert!(matches!(
+            Kpdc::create(1024, 1, FAST),
+            Err(Error::InvalidK { .. })
+        ));
         // K larger than the bit-count is also rejected (would underflow plane math)
-        assert!(matches!(Kpdc::create(2, 100, TP), Err(Error::InvalidK { .. })));
+        assert!(matches!(
+            Kpdc::create(2, 100, FAST),
+            Err(Error::InvalidK { .. })
+        ));
     }
 
     #[test]
-    fn roundtrip_two_payloads() {
-        let k = next_prime_coprime8(419);
-        let mut c = Kpdc::create(65536, k, TP).unwrap();
-        let pa = c.write("alpha-pass", b"the treaty is signed at dawn", &[], DEFAULT_MAXPROBE, None).unwrap();
-        let pb = c.write("beta-pass", b"pier 39, midnight", &["alpha-pass"], DEFAULT_MAXPROBE, None).unwrap();
+    fn roundtrip_two_payloads_recommended_cost() {
+        let mut c = Kpdc::create(SZ, K, REC).unwrap();
+        let pa = c
+            .write("alpha-pass", b"treaty at dawn", &[], MP, None)
+            .unwrap();
+        let pb = c
+            .write("beta-pass", b"pier 39", &["alpha-pass"], MP, None)
+            .unwrap();
         assert_ne!(pa, pb);
-        assert_eq!(c.read("alpha-pass", DEFAULT_MAXPROBE).map(|z| z.to_vec()), Some(b"the treaty is signed at dawn".to_vec()));
-        assert_eq!(c.read("beta-pass", DEFAULT_MAXPROBE).map(|z| z.to_vec()), Some(b"pier 39, midnight".to_vec()));
-        assert!(c.read("wrong-pass", DEFAULT_MAXPROBE).is_none());
+        assert_eq!(
+            c.read("alpha-pass", MP).map(|z| z.to_vec()),
+            Some(b"treaty at dawn".to_vec())
+        );
+        assert_eq!(
+            c.read("beta-pass", MP).map(|z| z.to_vec()),
+            Some(b"pier 39".to_vec())
+        );
+        assert!(c.read("wrong-pass", MP).is_none());
     }
 
     #[test]
     fn empty_payload_roundtrips() {
-        let k = next_prime_coprime8(101);
-        let mut c = Kpdc::create(16384, k, TP).unwrap();
-        c.write("pw", b"", &[], DEFAULT_MAXPROBE, None).unwrap();
-        assert_eq!(c.read("pw", DEFAULT_MAXPROBE).map(|z| z.to_vec()), Some(Vec::new()));
+        let mut c = Kpdc::create(SZ, K, REC).unwrap();
+        c.write("pw", b"", &[], MP, None).unwrap();
+        assert_eq!(c.read("pw", MP).map(|z| z.to_vec()), Some(Vec::new()));
     }
 
     #[test]
     fn tamper_is_detected() {
-        let k = next_prime_coprime8(257);
-        let mut c = Kpdc::create(32768, k, TP).unwrap();
-        c.write("pw", b"secret message here", &[], DEFAULT_MAXPROBE, None).unwrap();
+        let mut c = Kpdc::create(SZ, K, REC).unwrap();
+        c.write("pw", b"secret message here", &[], MP, None)
+            .unwrap();
         let mut bytes = c.into_bytes();
-        bytes[12345] ^= 0xFF;
-        let c2 = Kpdc::from_bytes(bytes, k, TP).unwrap();
+        bytes[100] ^= 0xFF;
+        let c2 = Kpdc::from_bytes(bytes, K, REC).unwrap();
         // either still reads (if flip missed this plane) or None — never wrong plaintext
-        if let Some(pt) = c2.read("pw", DEFAULT_MAXPROBE) {
+        if let Some(pt) = c2.read("pw", MP) {
             assert_eq!(pt.as_slice(), b"secret message here");
         }
     }
 
     #[test]
     fn wrong_salt_length_is_rejected() {
-        let k = next_prime_coprime8(101);
-        let mut c = Kpdc::create(16384, k, TP).unwrap();
+        let mut c = Kpdc::create(SZ, K, REC).unwrap();
         assert!(matches!(
-            c.write("pw", b"hi", &[], DEFAULT_MAXPROBE, Some(&[0u8; 8])),
+            c.write("pw", b"hi", &[], MP, Some(&[0u8; 8])),
             Err(Error::BadSaltLen { .. })
         ));
-        // exactly 16 bytes is accepted
-        assert!(c.write("pw", b"hi", &[], DEFAULT_MAXPROBE, Some(&[0u8; 16])).is_ok());
+        assert!(c.write("pw", b"hi", &[], MP, Some(&[0u8; 16])).is_ok());
+    }
+
+    #[test]
+    fn rerandomize_roundtrips() {
+        let mut c = Kpdc::create(SZ, K, REC).unwrap();
+        c.write_all_fresh(&[("a", b"alpha"), ("b", b"bravo")], MP)
+            .unwrap();
+        assert_eq!(c.read("a", MP).map(|z| z.to_vec()), Some(b"alpha".to_vec()));
+        assert_eq!(c.read("b", MP).map(|z| z.to_vec()), Some(b"bravo".to_vec()));
+        assert!(c.read("c", MP).is_none());
     }
 
     #[test]
     fn write_success_implies_readable_at_same_maxprobe() {
-        // Regression: a successful write must never place a payload beyond the
-        // window the reader probes. With a small maxprobe and colliding known_pws,
-        // write either succeeds-and-is-readable or returns ContainerFull — never
-        // silently unrecoverable.
+        // Regression (logic invariant — uses FAST cost, runs many writes): a successful
+        // write must never place a payload beyond the reader's probe window.
         let k = next_prime_coprime8(17);
         let mp = 3;
-        let mut c = Kpdc::create(16384, k, TP).unwrap();
+        let mut c = Kpdc::create(16384, k, FAST).unwrap();
         let pws = ["a", "b", "c", "d", "e", "f"];
         let mut written = Vec::new();
         for (i, pw) in pws.iter().enumerate() {

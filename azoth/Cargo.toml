@@ -2,8 +2,9 @@
 name = "azoth"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.87"
 description = "Deniable encryption container (K-Plane Deniable Container / KPDC)"
-license = "MIT OR Apache-2.0"
+license = "MIT"
 repository = "https://github.com/DataAlchemy/azoth"
 
 [lib]

@@ -59,11 +59,11 @@ entire layout and all keys wrong.
 
 - **Targeted:** deniability vs *single-look inspection* — given one image of the block and no
   correct password, the adversary cannot tell anything is stored or how much.
-- **Not targeted (v1):**
-  - *Multi-snapshot* adversaries (before/after images). Diffing reveals write activity and
-    leaks `K`. **Out of scope for v1.** Planned V2 mitigation: re-randomize the whole block on
-    every write (re-encrypt all payloads + refresh all fill). L4 already requires all
-    passwords to write, so this costs only O(B) work and defeats diffing entirely.
+- **Multi-snapshot** adversaries (before/after images): **defended by default** in the Rust
+  crate via whole-block re-randomization on every write (`write_all_fresh` / CLI default;
+  `--no-rerandomize` opts out). Every bit changes each write, so diffing reveals neither write
+  location nor `K`. This requires every password (L4); omitting one destroys its payload, so the
+  CLI gates it behind `--all-keys`. The plain in-place `write()` does NOT defend against this.
   - *Successful guessing.* A guessed `pw` compromises that payload. No honey-decoys;
     guess-resistance = **password** entropy + memory-hard KDF (not `K`).
   - *Read-side timing* channels (probe-count side channel). Optional hardening: constant

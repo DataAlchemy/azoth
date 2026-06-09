@@ -13,19 +13,18 @@ Pinned primitives (this reference):
   XOF / PRF       : SHAKE256
   fast hash       : SHA-256
   MAC             : HMAC-SHA256
-  intra-plane walk: SHAKE-driven distinct-slot sequence (counter mode)
+  intra-plane walk: SHAKE-driven distinct-slot sequence (counter mode + rejection sampling)
 
 THIS IS A READABLE REFERENCE, NOT PRODUCTION CODE.
-  * Slot selection uses `mod M_p`, which has small modulo bias -- use rejection
-    sampling in production.
-  * scrypt parameters are low for demo speed; raise N for real use.
-  * v1 scope: single-snapshot deniability only (see spec section 4). Multi-snapshot
-    diffing leaks K; the V2 whole-block re-randomize mode is not implemented here.
+  * Slot/home selection uses rejection sampling (no modulo bias), matching the Rust crate.
+  * scrypt N defaults to 2^16 (~64 MiB); raise for higher assurance.
+  * Whole-block re-randomize is available via write_all_fresh() (defeats multi-snapshot
+    diffing). v1 single-snapshot scope still applies to the plain in-place write().
 
 NOT WIRE-COMPATIBLE with the Rust crate (azoth/). The Rust implementation uses
-Argon2id (not scrypt) and a rejection-sampled XOF slot walk (not counter-mode
-modulo), so containers written by one cannot be read by the other. This file is a
-readable spec mirror, not an interoperable implementation.
+Argon2id (not scrypt) and a rejection-sampled XOF *stream* slot walk (vs this file's
+counter-mode rejection), so containers written by one cannot be read by the other.
+This file is a readable spec mirror, not an interoperable implementation.
 """
 
 import hashlib
@@ -38,8 +37,8 @@ T_BITS   = 128   # recognition token (fast plane reject)
 LEN_BITS = 32    # payload length field
 TAG_BITS = 256   # HMAC-SHA256 integrity tag
 
-# ---- scrypt cost (LOW for demo; raise N for real use) ----
-SCRYPT_N = 1 << 13
+# ---- scrypt cost (recommended-ish: N=2^16 -> ~64 MiB; raise for higher assurance) ----
+SCRYPT_N = 1 << 16
 SCRYPT_R = 8
 SCRYPT_P = 1
 SCRYPT_MAXMEM = 128 * SCRYPT_N * SCRYPT_R * 2
@@ -116,6 +115,10 @@ class KPDC:
         self.block = bytearray(block)
         self.B = len(self.block)
         self.nbits = 8 * self.B
+        if K < 2 or K > self.nbits:
+            raise ValueError(
+                "invalid K=%d: must satisfy 2 <= K <= block bit-count (%d)" % (K, self.nbits)
+            )
         self.K = K
 
     @classmethod
@@ -137,27 +140,39 @@ class KPDC:
         return hashlib.sha256(pw.encode("utf-8") + _u64(self.K)).digest()
 
     def _home(self, prk):
-        return int.from_bytes(shake(prk, b"home", nbytes=8), "big") % self.K
+        # unbiased reduction mod K via rejection sampling over a counter stream
+        zone = (2 ** 64 // self.K) * self.K
+        ctr = 0
+        while True:
+            x = int.from_bytes(shake(prk, b"home", _u64(ctr), nbytes=8), "big")
+            ctr += 1
+            if x < zone:
+                return x % self.K
 
     def _smask(self, prk):
         return shake(prk, b"saltmask", nbytes=S_BITS // 8)
 
     def _slot_seq(self, prk, plane, count):
-        """`count` distinct slot indices in [0, M_p), SHAKE-driven (counter mode)."""
+        """`count` distinct slot indices in [0, M_p), SHAKE counter-mode with
+        rejection sampling (no modulo bias)."""
         Mp = self._plane_slots(plane)
         if count > Mp:
             raise ValueError("walk longer than plane capacity")
+        zone = (2 ** 64 // Mp) * Mp
         seen = set()
         out = []
         ctr = 0
         while len(out) < count:
             x = int.from_bytes(
                 shake(prk, b"slots", _u64(plane), _u64(ctr), nbytes=8), "big"
-            ) % Mp
+            )
             ctr += 1
-            if x not in seen:
-                seen.add(x)
-                out.append(x)
+            if x >= zone:
+                continue
+            v = x % Mp
+            if v not in seen:
+                seen.add(v)
+                out.append(v)
         return out
 
     def _slow(self, pw, salt):
@@ -228,6 +243,8 @@ class KPDC:
         """
         if len(plaintext) >= (1 << 32):
             raise ValueError("payload length exceeds 32-bit length field (max ~4 GiB)")
+        if salt is not None and len(salt) != S_BITS // 8:
+            raise ValueError("salt must be exactly %d bytes" % (S_BITS // 8))
         prk = self._prk(pw)
         home = self._home(prk)
 
@@ -279,6 +296,20 @@ class KPDC:
             _set_bit(self.block, self._global(seq[j], plane), bit)
         return plane
 
+    def write_all_fresh(self, payloads, maxprobe=64, rng=secrets.token_bytes):
+        """Re-randomize the WHOLE container: discard the current block, fill a fresh
+        random one, and re-write every supplied payload with new salts. Defeats
+        multi-snapshot diffing. You MUST pass every payload to retain — anything
+        omitted is gone. Atomic: on error the original block is left untouched.
+
+        `payloads` is an iterable of (password, plaintext) pairs."""
+        payloads = list(payloads)
+        tmp = KPDC(bytearray(rng(self.B)), self.K)
+        for i, (pw, pt) in enumerate(payloads):
+            known = [p for (p, _) in payloads[:i]]
+            tmp.write(pw, pt, known, maxprobe, None)
+        self.block = tmp.block  # commit only after all writes succeed
+
 
 # --------------------------------------------------------------------------- #
 #  Self-test / demo / reproducible vector
@@ -295,17 +326,19 @@ if __name__ == "__main__":
     pw_a, msg_a = "correct horse battery staple", b"the treaty is signed at dawn"
     pw_b, msg_b = "hunter2-xK!", b"meet at pier 39, midnight"
 
-    pa = c.write(pw_a, msg_a, known_pws=[], salt=b"\x01" * 16)
-    pb = c.write(pw_b, msg_b, known_pws=[pw_a], salt=b"\x02" * 16)
-    print("wrote payload A in plane", pa, "| payload B in plane", pb)
+    # Whole-block re-randomize write (defeats multi-snapshot diffing): rebuild from
+    # ALL payloads. Anything omitted would be destroyed.
+    c.write_all_fresh([(pw_a, msg_a), (pw_b, msg_b)], maxprobe=4, rng=det_rng)
+    print("re-randomized container with 2 payloads under 2 passwords")
 
-    assert c.read(pw_a) == msg_a, "A round-trip failed"
-    assert c.read(pw_b) == msg_b, "B round-trip failed"
-    assert c.read("wrong password") is None, "wrong password should yield None"
+    assert c.read(pw_a, maxprobe=4) == msg_a, "A round-trip failed"
+    assert c.read(pw_b, maxprobe=4) == msg_b, "B round-trip failed"
+    assert c.read("wrong password", maxprobe=4) is None, "wrong password should yield None"
     print("round-trip OK; wrong password -> None")
 
     # holder of pw_a learns plane A only; cannot see B or the count
-    print("pw_a sees plane:", c.plane_of(pw_a), "| pw_b sees plane:", c.plane_of(pw_b))
+    print("pw_a sees plane:", c.plane_of(pw_a, 4), "| pw_b sees plane:", c.plane_of(pw_b, 4))
+    print("(tip: store genuine-but-innocuous decoy secrets too, as plausible cover)")
 
     # indistinguishability sniff: byte mean should sit near 127.5 (uniform)
     mean = sum(c.block) / len(c.block)
