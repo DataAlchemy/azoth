@@ -7,6 +7,20 @@
 //! default) with small K/maxprobe to keep the Argon2 call count low.
 
 use azoth::{next_prime_coprime8, KdfParams, Kpdc};
+use sha3::digest::{ExtendableOutput, Update, XofReader};
+use sha3::Shake256;
+
+/// Cryptographic deterministic fill: SHAKE256(seed). Used for the higher-order
+/// statistical tests so they are reproducible AND genuinely pass digram / runs /
+/// serial-correlation tests (a non-crypto PRG could show 2nd-order artifacts).
+fn shake_fill(n: usize, seed: &[u8]) -> Vec<u8> {
+    let mut h = Shake256::default();
+    h.update(seed);
+    let mut r = h.finalize_xof();
+    let mut v = vec![0u8; n];
+    r.read(&mut v);
+    v
+}
 
 // ---- a deterministic PRG so statistical tests never flake on getrandom ----
 struct XorShift(u64);
@@ -55,6 +69,62 @@ fn chi_square_bytes(block: &[u8]) -> f64 {
 fn ones_fraction(block: &[u8]) -> f64 {
     let ones: u64 = block.iter().map(|b| b.count_ones() as u64).sum();
     ones as f64 / (block.len() as f64 * 8.0)
+}
+
+/// Adjacent-bit transitions across the whole bitstream (a runs test). For i.i.d.
+/// uniform bits, E[T] = (nbits-1)/2, sd = sqrt(nbits-1)/2. Structure (e.g. a
+/// patterned or over-balanced block) shifts this well outside the band.
+fn bit_transitions(block: &[u8]) -> u64 {
+    let mut t = 0u64;
+    let mut prev = 0u8;
+    let mut first = true;
+    for &byte in block {
+        for i in 0..8 {
+            let bit = (byte >> i) & 1;
+            if first {
+                first = false;
+            } else if bit != prev {
+                t += 1;
+            }
+            prev = bit;
+        }
+    }
+    t
+}
+
+/// Byte-pair (digram) chi-square over non-overlapping pairs, 65536 bins. Catches
+/// 2nd-order structure that a 1st-order byte histogram misses.
+fn digram_chi_square(block: &[u8]) -> f64 {
+    let mut counts = vec![0u64; 65536];
+    let pairs = block.len() / 2;
+    for j in 0..pairs {
+        let idx = ((block[2 * j] as usize) << 8) | (block[2 * j + 1] as usize);
+        counts[idx] += 1;
+    }
+    let expected = pairs as f64 / 65536.0;
+    counts
+        .iter()
+        .map(|&o| {
+            let d = o as f64 - expected;
+            d * d / expected
+        })
+        .sum()
+}
+
+/// Lag-1 serial correlation of byte values. ~0 for independent bytes; a non-zero
+/// value reveals linear inter-byte structure.
+fn serial_correlation(block: &[u8]) -> f64 {
+    let n = block.len();
+    let mean = block.iter().map(|&b| b as f64).sum::<f64>() / n as f64;
+    let mut num = 0.0;
+    let mut den = 0.0;
+    for i in 0..n {
+        let a = block[i] as f64 - mean;
+        let b = block[(i + 1) % n] as f64 - mean;
+        num += a * b;
+        den += a * a;
+    }
+    num / den
 }
 
 const REC: KdfParams = KdfParams::RECOMMENDED;
@@ -251,4 +321,104 @@ fn known_answer_write_and_read() {
         c.read(KAT_PW, KAT_MP).map(|z| z.to_vec()),
         Some(KAT_PT.to_vec())
     );
+}
+
+// =========================================================================== //
+//  Expanded indistinguishability suite — confirm that WRITES never push the
+//  container off the statistical norm (1st-order, 2nd-order, runs, serial corr),
+//  across heavy fill and multiple sizes / K. A deviation here would signal a
+//  cryptographic bug (the right response is to fix the primitive, never to
+//  "flatten" the histogram — perfect flatness is itself a detectable signature).
+// =========================================================================== //
+
+#[test]
+fn heavily_filled_container_stays_uniform() {
+    // Pack ~one large payload per plane (close to capacity), then check the block
+    // is still uniform in byte value, bit density, and runs. Here PRF output is the
+    // majority of the bits, so this stresses "do our modifications stay on-norm".
+    let k = next_prime_coprime8(17);
+    let mp = k as usize;
+    let mut c = Kpdc::from_bytes(shake_fill(65_536, b"heavy-fill"), k, FAST).unwrap();
+    let mut known: Vec<String> = Vec::new();
+    let mut placed = 0usize;
+    while placed < k as usize {
+        let pw = format!("p{placed}");
+        let kr: Vec<&str> = known.iter().map(|s| s.as_str()).collect();
+        match c.write(&pw, &vec![0xABu8; 3500], &kr, mp, None) {
+            Ok(_) => {
+                known.push(pw);
+                placed += 1;
+            }
+            Err(_) => break,
+        }
+    }
+    assert!(
+        placed >= 12,
+        "expected to pack many payloads, only placed {placed}"
+    );
+
+    let block = c.as_bytes();
+    let nbits = (block.len() * 8) as f64;
+    let chi = chi_square_bytes(block);
+    let ones = ones_fraction(block);
+    let t = bit_transitions(block) as f64;
+    assert!(chi > 120.0 && chi < 420.0, "heavy-fill byte chi {chi}");
+    assert!((ones - 0.5).abs() < 0.01, "heavy-fill bit density {ones}");
+    let exp_t = (nbits - 1.0) / 2.0;
+    assert!(
+        (t - exp_t).abs() < 3.0 * nbits.sqrt(),
+        "heavy-fill runs {t} vs expected {exp_t}"
+    );
+}
+
+#[test]
+fn second_order_structure_absent() {
+    // 512 KiB block + several payloads: digram (byte-pair) chi-square and lag-1
+    // serial correlation must look like independent uniform bytes.
+    let k = next_prime_coprime8(131);
+    let mut c = Kpdc::from_bytes(shake_fill(524_288, b"digram-seed"), k, FAST).unwrap();
+    let mut known: Vec<String> = Vec::new();
+    for i in 0..10 {
+        let kr: Vec<&str> = known.iter().map(|s| s.as_str()).collect();
+        c.write(&format!("d{i}"), &vec![0x5Au8; 3500], &kr, 12, None)
+            .unwrap();
+        known.push(format!("d{i}"));
+    }
+    let block = c.as_bytes();
+    // 65535 d.o.f.: mean 65535, sd ~362. Generous +/-4000 (~11 sd) catches structure
+    // without flaking. (A perfectly "flattened" block would instead drive the 1st-order
+    // chi-square to ~0, which the uniformity tests above reject.)
+    let dchi = digram_chi_square(block);
+    assert!(
+        (dchi - 65_535.0).abs() < 4000.0,
+        "digram chi {dchi} out of band"
+    );
+    let r = serial_correlation(block);
+    assert!(r.abs() < 0.02, "serial correlation {r} too high");
+}
+
+#[test]
+fn uniform_across_sizes_and_k() {
+    for (sz, kbase) in [(16_384usize, 11u64), (49_152, 53), (131_072, 257)] {
+        let k = next_prime_coprime8(kbase);
+        let seed = format!("size-{sz}-k-{k}");
+        let mut c = Kpdc::from_bytes(shake_fill(sz, seed.as_bytes()), k, FAST).unwrap();
+        let mut known: Vec<String> = Vec::new();
+        for i in 0..5 {
+            let kr: Vec<&str> = known.iter().map(|s| s.as_str()).collect();
+            let _ = c.write(&format!("s{i}"), &[0x33u8; 64], &kr, 4, None);
+            known.push(format!("s{i}"));
+        }
+        let block = c.as_bytes();
+        let chi = chi_square_bytes(block);
+        let ones = ones_fraction(block);
+        assert!(
+            chi > 120.0 && chi < 420.0,
+            "size {sz} k {k}: byte chi {chi}"
+        );
+        assert!(
+            (ones - 0.5).abs() < 0.015,
+            "size {sz} k {k}: bit density {ones}"
+        );
+    }
 }
