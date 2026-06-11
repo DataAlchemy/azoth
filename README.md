@@ -110,6 +110,7 @@ containers are *not* wire-compatible (different KDF and slot walk); each reads o
 | Path | What |
 |---|---|
 | [`azoth/`](azoth/) | **The Rust implementation** — `azoth` library crate + CLI (`create`/`write`/`read`). The real, fast one. |
+| [`TECHNICAL_DETAILS.md`](TECHNICAL_DETAILS.md) | **In-depth write-up & self-review** — full construction, rationale, rejected designs, and exactly how we tested security (statistical suite + KAT + fuzz + a 4-round multi-agent adversarial review). |
 | [`kpdc_reference.py`](kpdc_reference.py) | The **readable reference** (Python stdlib, no deps). Clarity over speed; mirrors the spec. |
 | [`_bmad-output/.../8pdc-spec-draft.md`](_bmad-output/brainstorming/8pdc-spec-draft.md) | **The design spec (v0.3)** — threat model, algorithms, honest weaknesses from an adversarial review. |
 | [`_bmad-output/.../brainstorming-session-2026-06-06.md`](_bmad-output/brainstorming/brainstorming-session-2026-06-06.md) | The brainstorming log that produced the design (14 building blocks → adversarial pass). |
@@ -121,13 +122,18 @@ containers are *not* wire-compatible (different KDF and slot walk); each reads o
 ## ⚠ Status & honest scope
 
 Brainstorm output — **experimental, not security-audited. Do not protect anything real with it yet.**
-v1 targets deniability against a *single-look* inspector; multi-snapshot diffing (imaging the block
-before & after a write) is a known gap deferred to a V2 *whole-block re-randomize* mode — see spec
-§4 and §11. The Rust crate hardens the reference with **Argon2id** (configurable, credential-bound
-cost), **rejection-sampled** slots (no modulo bias), **constant-time** tag/token compares, **zeroized**
-key material, and **atomic** container writes. Two caveats remain by design: a *correct guess* still
-compromises that payload (the token is an offline oracle gated only by the KDF — use a strong password
-and high KDF cost), and the multi-snapshot gap above. The Python reference favors clarity over all of this.
+Exactly what it does, why, and **how we tested it was secure** — the statistical suite, the Known
+Answer Test, fuzzing, and a four-round multi-agent **adversarial self-review** — is documented in
+detail in **[`TECHNICAL_DETAILS.md`](TECHNICAL_DETAILS.md)** (see §10 rejected designs, §11 testing).
+The Rust crate hardens the reference with **Argon2id** (configurable, credential-bound cost),
+**rejection-sampled** slots (no modulo bias), **constant-time** tag/token compares, **zeroized**
+key material, and **atomic** container writes. **Multi-snapshot diffing** (imaging the block before
+and after a write) is **defended by default** via whole-block re-randomization — every write
+regenerates the entire block, so nothing is localizable (`--no-rerandomize` opts out for a faster
+in-place write that is *not* multi-snapshot-safe; see spec §4 and `TECHNICAL_DETAILS.md` §8). The
+main caveat that remains **by design**: a *correct guess* of the credential compromises that payload
+(the token is an offline oracle gated only by the KDF — use a strong password and high KDF cost).
+The Python reference favors clarity over all of this.
 
 And remember: azoth hides *what* and *how much*, not *that a high-entropy blob exists* — pair it
 with a plausible cover (disk free space, a "wiped" partition, or a benign decoy payload).
