@@ -101,6 +101,23 @@ c.read("mallory", 64); // None  (just noise)
 > Re-randomize is **on by default**; use `--no-rerandomize` for a faster in-place write
 > that leaves a multi-snapshot diffing fingerprint.
 
+### Writing straight to a raw device (no filesystem)
+
+A whole unformatted block device full of random bytes is a strong cover ("blank/wiped stick"),
+with no filesystem metadata. Point azoth directly at the device — `--raw` is auto-enabled for
+block devices, and `create` auto-detects the size:
+
+```bash
+sudo azoth create --raw --out /dev/sdX --k "$(azoth prime 419)"   # fills the WHOLE device
+sudo azoth write  --raw --file /dev/sdX --k <K> --password ... --data secret.txt --known ... --all-keys
+sudo azoth read   --file /dev/sdX --k <K> --password ...
+```
+
+Caveats: needs root; the whole device is read into RAM per operation; the default re-randomize
+rewrites the entire device on every write (slow over USB, and it burns flash cycles — occasional
+use only); fill the **entire** device (don't leave a structured tail); and "2 GB" sticks are
+usually a bit under — the auto-detected size is authoritative.
+
 The **Python reference** (`kpdc_reference.py`) mirrors this for readability — run
 `python3 kpdc_reference.py` for the same self-test. **Note:** the Python and Rust
 containers are *not* wire-compatible (different KDF and slot walk); each reads only its own.

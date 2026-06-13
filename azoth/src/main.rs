@@ -56,12 +56,17 @@ impl From<KdfArgs> for KdfParams {
 enum Cmd {
     /// Create a new container of `size` random bytes.
     Create {
+        /// Container size in bytes. May be omitted for a block device (auto-detected).
         #[arg(long)]
-        size: usize,
+        size: Option<usize>,
         #[arg(long)]
         k: u64,
         #[arg(long)]
         out: String,
+        /// Write straight to a raw target (e.g. a block device /dev/sdX): no temp-file + rename.
+        /// Auto-enabled when the target is a block device.
+        #[arg(long)]
+        raw: bool,
     },
     /// Write a payload. By default the WHOLE container is re-randomized (multi-snapshot safe),
     /// which requires every existing password via --known plus --all-keys to confirm.
@@ -88,6 +93,9 @@ enum Cmd {
         no_rerandomize: bool,
         #[arg(long, default_value_t = DEFAULT_MAXPROBE)]
         maxprobe: usize,
+        /// Write straight to a raw target (block device): no temp-file + rename. Auto-enabled for block devices.
+        #[arg(long)]
+        raw: bool,
         #[command(flatten)]
         kdf: KdfArgs,
     },
@@ -113,11 +121,41 @@ enum Cmd {
 
 fn main() -> Result<()> {
     match Cli::parse().cmd {
-        Cmd::Create { size, k, out } => {
+        Cmd::Create { size, k, out, raw } => {
             warn_if_bad_k(k);
+            let raw = raw || is_block_device(&out);
+            let size = match size {
+                Some(s) => s,
+                None if raw => device_size(&out)
+                    .with_context(|| format!("auto-detecting size of {}", out))?
+                    as usize,
+                None => bail!(
+                    "--size is required (or use --raw on a block device to auto-detect its size)"
+                ),
+            };
+            if raw {
+                if let Ok(dev) = device_size(&out) {
+                    if (size as u64) < dev {
+                        eprintln!(
+                            "warning: size {} is smaller than the target ({} bytes); the remaining {} \
+                             bytes keep their old contents — a structure-after-noise tell. Fill the whole \
+                             device for best deniability.",
+                            size,
+                            dev,
+                            dev - size as u64
+                        );
+                    }
+                }
+            }
             let c = Kpdc::create(size, k, KdfParams::default()).map_err(anyhow_err)?;
-            write_atomic(&out, c.as_bytes())?;
-            eprintln!("created {} ({} bytes, K={})", out, size, k);
+            write_target(&out, c.as_bytes(), raw)?;
+            eprintln!(
+                "created {} ({} bytes, K={}{})",
+                out,
+                size,
+                k,
+                if raw { ", raw" } else { "" }
+            );
             eprintln!(
                 "\nTip: a brand-new container is pure noise. Before storing your real secret,\n\
                  consider writing one or two *genuine but innocuous* secrets (an old password,\n\
@@ -135,11 +173,13 @@ fn main() -> Result<()> {
             all_keys,
             no_rerandomize,
             maxprobe,
+            raw,
             kdf,
         } => {
             kdf.validate()?;
             warn_if_bad_k(k);
             warn_if_custom_kdf(&kdf);
+            let raw = raw || is_block_device(&file);
             let pw = resolve_password(password)?;
             let block = std::fs::read(&file).with_context(|| format!("reading {}", file))?;
             let plaintext = read_input(&data)?;
@@ -150,7 +190,7 @@ fn main() -> Result<()> {
                 let plane = c
                     .write(&pw, &plaintext, &known_refs, maxprobe, None)
                     .map_err(anyhow_err)?;
-                write_atomic(&file, c.as_bytes())?;
+                write_target(&file, c.as_bytes(), raw)?;
                 eprintln!(
                     "wrote {} bytes into plane {} (in-place; multi-snapshot diffing NOT defended)",
                     plaintext.len(),
@@ -183,7 +223,7 @@ fn main() -> Result<()> {
                     .map(|(p, d)| (p.as_str(), d.as_slice()))
                     .collect();
                 c.write_all_fresh(&refs, maxprobe).map_err(anyhow_err)?;
-                write_atomic(&file, c.as_bytes())?;
+                write_target(&file, c.as_bytes(), raw)?;
                 eprintln!(
                     "re-randomized container with {} payload(s) — whole block rewritten (multi-snapshot safe)",
                     refs.len()
@@ -262,11 +302,53 @@ fn read_input(path: &str) -> Result<Vec<u8>> {
 }
 
 /// Write via a temp file + atomic rename so a crash can't corrupt the container.
+/// (Only valid for regular files — see `write_target` for raw block devices.)
 fn write_atomic(path: &str, data: &[u8]) -> Result<()> {
     let tmp = format!("{}.tmp.{}", path, std::process::id());
     std::fs::write(&tmp, data).with_context(|| format!("writing {}", tmp))?;
     std::fs::rename(&tmp, path).with_context(|| format!("renaming into {}", path))?;
     Ok(())
+}
+
+/// Write the full container to `path`. For raw targets (block devices) write the bytes
+/// directly and fsync — the temp-file + rename trick of `write_atomic` is invalid on a
+/// device node (it would replace the node in /dev, not write to the device).
+fn write_target(path: &str, data: &[u8], raw: bool) -> Result<()> {
+    if !raw {
+        return write_atomic(path, data);
+    }
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(path)
+        .with_context(|| format!("opening {} for raw write", path))?;
+    f.write_all(data)
+        .with_context(|| format!("writing {}", path))?;
+    f.sync_all()
+        .with_context(|| format!("flushing {} to disk", path))?;
+    Ok(())
+}
+
+/// True if `path` is a block device (so writes must go directly to it).
+#[cfg(unix)]
+fn is_block_device(path: &str) -> bool {
+    use std::os::unix::fs::FileTypeExt;
+    std::fs::metadata(path)
+        .map(|m| m.file_type().is_block_device())
+        .unwrap_or(false)
+}
+#[cfg(not(unix))]
+fn is_block_device(_path: &str) -> bool {
+    false
+}
+
+/// Byte length of a file or block device (seek to end — works on devices where stat reports 0).
+fn device_size(path: &str) -> Result<u64> {
+    use std::io::{Seek, SeekFrom};
+    let mut f = std::fs::File::open(path).with_context(|| format!("opening {}", path))?;
+    f.seek(SeekFrom::End(0))
+        .with_context(|| format!("measuring {}", path))
 }
 
 fn demo() -> Result<()> {
