@@ -6,8 +6,15 @@ back every claim with reproducible evidence.
 
 ## The artifact
 
-- **`challenge2_block.bin`** — a **65,536-byte (64 KiB)** azoth container, **filled** (every plane
-  is occupied: one encrypted payload per plane).
+- **Three snapshots of the SAME 64 KiB container**, each **filled** (every plane occupied, one
+  encrypted payload per plane), taken across re-randomizing writes (azoth's default write mode):
+  - `challenge2_block.bin` (snapshot 1)
+  - `challenge2_snapshot2.bin` (snapshot 2)
+  - `challenge2_snapshot3.bin` (snapshot 3)
+
+  Same secret K and same payloads in all three; only the per-write salts and the random fill
+  differ between snapshots. This lets you attempt **multi-snapshot** attacks (diff them), not just
+  single-snapshot analysis.
 - Full source + docs (read them): `azoth/src/lib.rs`, `kpdc_reference.py`, `TECHNICAL_DETAILS.md`,
   spec in `_bmad-output/brainstorming/8pdc-spec-draft.md`, repo https://github.com/DataAlchemy/azoth.
 
@@ -27,16 +34,21 @@ in the range [5, 250]** — there are ~50 candidates. Your job is to determine w
 
 ## The claim to disprove
 
-azoth claims **K is not recoverable from a single snapshot**: because every bit — payload or
-fill — is uniform PRF/CSPRNG output regardless of which plane (residue class mod K) it sits in,
-no statistical or structural test on one block should reveal K.
+azoth claims **K is not recoverable** — not from a single snapshot (every bit, payload or fill, is
+uniform PRF/CSPRNG output regardless of its residue class mod K), and **not from these multiple
+snapshots either**, because the default re-randomize write regenerates the entire block every time
+(only salts/fill change), so diffing should reveal no residue-class period.
 
 ## Your task
 
 Determine K. Reasonable attack ideas (not exhaustive):
+- **Multi-snapshot diffing:** XOR/compare the three snapshots and look at *which positions changed*.
+  If only a fixed subset changed and their indices shared a period, the GCD of their gaps would give
+  K. (Note: an *in-place* write would leak K this way — the point of this test is whether the
+  *default re-randomize* write, used here, defeats it.)
 - **Residue-class tests:** for each candidate K, partition bits by `g mod K` and test each class
-  for any deviation (bit-ones bias, byte distribution, chi-square). A true K would make *its*
-  residue classes structured while others look random.
+  for any deviation (bit-ones bias, byte distribution, chi-square) — on any one snapshot, or pooled.
+  A true K would make *its* residue classes structured while others look random.
 - **Spectral / autocorrelation:** FFT of the bit/byte stream, autocorrelation at lag multiples of
   candidate K, looking for a period.
 - **Source review:** is there any derivation, layout, or placement detail in `lib.rs` that leaves
