@@ -44,7 +44,7 @@ different passwords decrypt two completely different plaintexts from the very sa
 | 🜂 **Indistinguishable** | An empty block and a full one are byte-for-byte statistically identical. There is nothing to find. |
 | 🜄 **Many-in-one** | Up to `K` payloads share one block, each on its own disjoint "plane." Set `K` as high as you want. |
 | 🜁 **Plausibly deniable** | Reveal one password under pressure; against an inspector without the others, their existence stays computationally deniable. |
-| 🜃 **No verifier** | The container never confirms a password. A wrong guess just yields more noise — no oracle, no tell. |
+| 🜃 **No verifier an outsider can use** | No header, no fixed marker. The token that recognizes a correct password is random-looking and sits at a *credential-derived, scattered* position — without a candidate `(password, K, cost)` you can't find it, test it, or even tell data exists. Supply a candidate and it *does* confirm a correct guess: an offline oracle gated by the memory-hard KDF (use a strong password), not honey-encryption. |
 
 ## ✦ The trick, in one breath
 
