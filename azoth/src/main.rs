@@ -3,7 +3,7 @@
 //! A container is just a file of random-looking bytes. `K` and the KDF cost are
 //! part of the credential and are never stored in the file — supply them every time.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use azoth::{is_recommended_k, next_prime_coprime8, KdfParams, Kpdc, DEFAULT_MAXPROBE};
 use clap::{Args, Parser, Subcommand};
 use std::io::{Read, Write};
@@ -56,8 +56,9 @@ impl From<KdfArgs> for KdfParams {
 enum Cmd {
     /// Create a new container of `size` random bytes.
     Create {
-        /// Container size in bytes. May be omitted for a block device (auto-detected).
-        #[arg(long)]
+        /// Container size: bytes, or with a unit — e.g. 64k, 512mb, 2gb (binary, 1024-based).
+        /// May be omitted for a block device (auto-detected).
+        #[arg(long, value_parser = size_parser)]
         size: Option<usize>,
         #[arg(long)]
         k: u64,
@@ -289,6 +290,39 @@ fn resolve_password(opt: Option<String>) -> Result<Zeroizing<String>> {
             rpassword::prompt_password("password: ").context("reading password")?,
         )),
     }
+}
+
+/// Parse a size like `65536`, `64k`, `512mb`, `2gb` (binary, 1024-based) into bytes.
+fn parse_size(s: &str) -> Result<usize> {
+    let lower = s.trim().to_ascii_lowercase();
+    let mut t = lower.as_str();
+    t = t.strip_suffix('b').unwrap_or(t); // accept the optional trailing 'b' in kb/mb/gb
+    let (num, mult): (&str, u64) = if let Some(n) = t.strip_suffix('k') {
+        (n, 1 << 10)
+    } else if let Some(n) = t.strip_suffix('m') {
+        (n, 1 << 20)
+    } else if let Some(n) = t.strip_suffix('g') {
+        (n, 1 << 30)
+    } else if let Some(n) = t.strip_suffix('t') {
+        (n, 1u64 << 40)
+    } else {
+        (t, 1)
+    };
+    let val: u64 = num.trim().parse().map_err(|_| {
+        anyhow!(
+            "invalid size {:?}: use a number, optionally with k/kb/m/mb/g/gb (1024-based)",
+            s
+        )
+    })?;
+    let bytes = val
+        .checked_mul(mult)
+        .ok_or_else(|| anyhow!("size {:?} overflows", s))?;
+    usize::try_from(bytes).map_err(|_| anyhow!("size {:?} too large for this platform", s))
+}
+
+/// clap value parser wrapper (its error must be a String).
+fn size_parser(s: &str) -> std::result::Result<usize, String> {
+    parse_size(s).map_err(|e| e.to_string())
 }
 
 fn read_input(path: &str) -> Result<Vec<u8>> {
