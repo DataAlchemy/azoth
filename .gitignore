@@ -9,3 +9,6 @@ __pycache__/
 # Rust build artifacts
 target/
 azoth/target/
+
+# Challenge answer key — must NEVER be committed (contains the passwords)
+challenge_solution.txt
