@@ -1,0 +1,27 @@
+A) RESIDUE-CLASS ones-bias sweep, K=2..512 (analytic chi2_K p-values)
+   tests=511, Bonferroni 0.01 threshold p<1.96e-05
+   smallest-p strides:
+     K=218: chi2=  297.61  p=2.7135e-04
+     K= 38: chi2=   73.93  p=4.2811e-04
+     K=  4: chi2=   20.14  p=4.6900e-04
+     K=190: chi2=  255.89  p=1.0117e-03
+     K= 20: chi2=   44.66  p=1.2250e-03
+     K= 76: chi2=  117.50  p=1.5985e-03
+     K=  8: chi2=   23.77  p=2.5055e-03
+     K=412: chi2=  492.99  p=3.7024e-03
+   TRUE K=11: chi2=10.70  p=0.468  (rank 293/511 by smallness — i.e. unremarkable)
+   strides surviving familywise correction: NONE
+
+B) BIT AUTOCORRELATION spectrum, all lags 1..N/2 (analytic N(0,1) z)
+   lags tested=262143; familywise |z| threshold (alpha=0.01) = 5.50
+   max |z| = 4.92 at lag 45191  (within noise)
+   lag   8 (construction stride): z=-1.23  p=0.218
+   lag  11 (construction stride): z=-0.12  p=0.907
+   lag  88 (construction stride): z=+1.06  p=0.291
+   lags exceeding familywise threshold: 0
+
+CAPSTONE VERDICT
+----------------------------------------------------------------
+ No residue stride (any K<=512) and no autocorrelation lag survives
+ familywise correction. K=11 and lags 8/11/88 are unremarkable.
+ => No plane/periodicity structure. Indistinguishable from random.

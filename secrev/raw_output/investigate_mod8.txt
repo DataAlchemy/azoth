@@ -1,0 +1,31 @@
+A) Challenge per-bit-position ones imbalance (z = (ones-50%)/sd, 65536 bits/position)
+   bitpos     ones       frac        z
+        0    32827    0.50090     0.46
+        1    32319    0.49315    -3.51
+        2    32928    0.50244     1.25
+        3    32680    0.49866    -0.69
+        4    32876    0.50165     0.84
+        5    32455    0.49522    -2.45
+        6    32805    0.50056     0.29
+        7    32968    0.50305     1.56
+   -> res_ones_chisq_mod8 = 23.769  (chi2_8: mean 8, sd 4)
+   -> analytic tail p = P(chi2_8 > 23.77) = 2.5055e-03
+
+B) Empirical null from fresh /dev/urandom blocks (same size)
+   5000 random blocks: mean 7.969, sd 3.963, max 38.887
+   fraction of RANDOM blocks with stat >= challenge (23.77): 11/5000 = 0.0022
+   (i.e. a pure-random block is at least this 'biased' ~0.2% of the time)
+
+C) Does the AZOTH construction push res_ones_chisq_mod8 up?
+   empty   azoth (n=32): mean 7.864 sd 3.077 max 16.997
+   full    azoth (n=32):  mean 7.643 sd 2.727 max 14.333
+   fullmax azoth (n=4):  mean 6.035 sd 2.475 max 9.289
+   random  (sim n=5000):         mean 7.969 sd 3.963
+   empty-vs-full t-test p = 0.766  (construction does NOT change this stat if p large)
+
+CONCLUSION
+----------------------------------------------------------------------
+The challenge's mod-8 value is a TAIL FLUCTUATION shared by pure random
+(~0.2% of random blocks match or exceed it) and the azoth
+construction does NOT elevate it (empty~full~random). It therefore CANNOT
+separate an azoth container from random — it is NOT a distinguisher.

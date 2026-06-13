@@ -1,0 +1,27 @@
+MULTI-SNAPSHOT ANALYSIS — does imaging across many writes reveal payloads?
+
+=== DEFAULT re-randomize write (write_all_fresh)  (N=32 snapshots, 524288 bits) ===
+  change_freq:  mean 0.5000  min 0.1290  max 0.9032
+  per-pos mean: mean 0.5001  min 0.0938  max 0.9375
+  NEVER-changing positions: 0  (0.00% of block)
+    -> NO static positions: written/unwritten partition is INVISIBLE
+  most extreme change-freq deviation from 0.5: z = 4.49 (flat if small; structural if huge)
+
+=== in-place write (no_rerandomize)  (N=32 snapshots, 524288 bits) ===
+  change_freq:  mean 0.4924  min 0.0000  max 0.9032
+  per-pos mean: mean 0.4998  min 0.0000  max 1.0000
+  NEVER-changing positions: 7904  (1.51% of block)
+    -> these are the UNWRITTEN slots; their per-plane (mod 11) counts:
+       [719, 719, 719, 719, 719, 719, 718, 718, 718, 718, 718]  (sum 7904)
+    -> threshold change_freq>0.25: 515510 'written' vs 8778 'static/unwritten' => the payload partition is RECOVERED without any password
+  most extreme change-freq deviation from 0.5: z = 5.57 (flat if small; structural if huge)
+
+==========================================================================
+CONCLUSION
+==========================================================================
+ DEFAULT (rerand): never-changing positions = 0; change map flat ~0.5.
+   => multi-snapshot of a full random/default container shows NOTHING:
+      no position is static, no payload boundary, no count, no K.
+ in-place:         never-changing positions = 7904 (the unwritten slots).
+   => the written/unwritten partition leaks -> presence/size/count/location.
+      This is the documented reason write_all_fresh is the CLI default.

@@ -1,0 +1,59 @@
+# controls: 32 empty, 32 full, 4 fullmax, 2 random
+
+====================================================================================================
+1) CHALLENGE vs CONTROL DISTRIBUTION  (z = how many control-sd's the challenge sits from the control mean)
+====================================================================================================
+statistic                     challenge      ctrl_mean      ctrl_sd        z       ctrl_min       ctrl_max inside?
+------------------------------------------------------------------------------------------------------------------
+byte_chisq                    293.54688      253.25313     23.05658     1.75      209.99219      346.82812 YES
+monobit_z                      -0.78997       -0.11273      0.90820    -0.75       -2.18485        2.11027 YES
+runs_z                          1.17529        0.04968      0.93098     1.21       -2.63646        2.26910 YES
+digram_chisq                65268.00000    65500.68571    384.40074    -0.61    64680.00000    66120.00000 YES
+serial_corr                    -0.00304        0.00016      0.00460    -0.70       -0.00919        0.01768 YES
+res_ones_chisq_mod7             4.33203        6.23241      3.78749    -0.50        1.01676       20.11330 YES
+res_ones_chisq_mod8            23.76880        7.66678      2.89528     5.56        2.31818       16.99738 *** NO ***
+res_ones_chisq_mod11           10.70266       10.77745      4.77691    -0.02        2.58027       30.61350 YES
+res_ones_chisq_mod16          116.79683       89.34640     13.37581     2.05       61.05550      123.57908 YES
+res_byte_chisq_mod11         2841.55519     2799.54306     71.10172     0.59     2618.10538     2966.24313 YES
+gzip_ratio                      1.00058        1.00058      0.00000     0.00        1.00058        1.00058 YES
+bz2_ratio                       1.00967        1.00978      0.00018    -0.62        1.00926        1.01010 YES
+lzma_ratio                      1.00098        1.00098      0.00000     0.00        1.00098        1.00098 YES
+entropy_bpb                     7.99678        7.99721      0.00025    -1.69        7.99617        7.99768 YES
+min_entropy                     7.70998        7.76145      0.02773    -1.86        7.69166        7.81512 YES
+spectral_maxpow                12.22359       13.35426      1.48664    -0.76       10.96157       19.85564 YES
+blockfreq_chisq              4048.50000     4067.88795     88.45761    -0.22     3846.93750     4274.18750 YES
+cusum_max                       1.10762        1.18253      0.48856    -0.15        0.37703        2.48178 YES
+
+====================================================================================================
+2) DECISIVE TEST — does 'empty == full' hold? (Welch t-test + Mann-Whitney per statistic)
+   A statistic that separates empty from full IS the structural distinguisher.
+====================================================================================================
+statistic                    empty_mean      full_mean          t_p         mw_p  separates?
+--------------------------------------------------------------------------------------------
+byte_chisq                    251.41406      256.86060     3.44e-01     5.06e-01  no
+monobit_z                      -0.09098       -0.13629     8.45e-01     7.27e-01  no
+runs_z                          0.06051        0.00682     8.24e-01     9.14e-01  no
+digram_chisq                65593.37500    65485.62500     2.42e-01     2.27e-01  no
+serial_corr                     0.00122       -0.00073     9.44e-02     1.54e-02  no
+res_ones_chisq_mod7             7.13090        5.60287     1.14e-01     2.92e-01  no
+res_ones_chisq_mod8             7.86369        7.64283     7.66e-01     9.20e-01  no
+res_ones_chisq_mod11           10.55170       11.36702     5.14e-01     3.86e-01  no
+res_ones_chisq_mod16           90.24905       90.32325     9.82e-01     8.56e-01  no
+res_byte_chisq_mod11         2800.81528     2810.35124     5.81e-01     5.06e-01  no
+gzip_ratio                      1.00058        1.00058          nan          nan  no
+bz2_ratio                       1.00978        1.00979     7.58e-01     8.61e-01  no
+lzma_ratio                      1.00098        1.00098          nan          nan  no
+entropy_bpb                     7.99723        7.99717     3.42e-01     5.41e-01  no
+min_entropy                     7.76146        7.75869     6.96e-01     5.81e-01  no
+spectral_maxpow                13.35249       13.32145     9.36e-01     6.72e-01  no
+blockfreq_chisq              4072.62109     4056.39746     4.67e-01     3.94e-01  no
+cusum_max                       1.29410        1.05035     4.54e-02     3.93e-02  no
+
+(Bonferroni alpha = 0.01/18 = 5.56e-04)
+
+====================================================================================================
+VERDICT
+====================================================================================================
+Challenge is an OUTLIER vs controls on: [('res_ones_chisq_mod8', 5.561465453166816)]
+NO statistic separates empty from full at Bonferroni alpha. 'empty == full' holds.
+>>> NO BREAK on the statistical/structural axis.

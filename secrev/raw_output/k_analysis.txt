@@ -1,0 +1,51 @@
+==============================================================================
+(1) Determine K from the SINGLE challenge block alone
+==============================================================================
+ For each candidate K, res_ones_chisq_mod K should be ~chi2_K (mean K) if there
+ is NO plane structure. A true K would stand out as a LOW p-value (excess bias).
+   K    chi2_K   analytic p
+   2      8.47       0.0145
+   4     20.14       0.0005  <-- would indicate structure
+   7      4.33       0.7408
+   8     23.77       0.0025  <-- would indicate structure
+  11     10.70       0.4685
+  12     23.31       0.0252
+  13     13.36       0.4201
+  14     26.00       0.0259
+  16     30.55       0.0154
+  19     33.65       0.0202
+  20     44.66       0.0012  <-- would indicate structure
+  22     33.45       0.0559
+  28     44.07       0.0274
+  32     46.79       0.0443
+
+ K=11 (the true value): chi2_11 = 10.70, p = 0.468  -> indistinguishable from every other K
+ residue strides with p<0.01: [4, 8, 20]
+ => The block gives NO signal for K=11 over any other K. K is NOT recoverable
+    from a single snapshot. We only 'know' K=11 because the challenge stated it
+    (K is part of the credential, transmitted out-of-band, exactly as designed).
+
+==============================================================================
+(2) The ONLY leak path: multi-snapshot diff of an IN-PLACE write (TECH §8)
+==============================================================================
+ changed bit positions between snap0 and snapA: 665
+ their residues mod 11: [6]  (a single class => one plane touched)
+ GCD of changed-position differences = 11   <== recovers K with no password
+ => two snapshots of an in-place write leak K (=11) AND that plane 6 holds a payload (existence+location leak).
+
+==============================================================================
+(3) The DEFAULT re-randomize write hides K again
+==============================================================================
+ changed bits snapA->snapB: 261929 (50.0% of all bits)
+ residues mod 11 of changed positions: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]  (ALL classes => whole block)
+ GCD of changed-position differences = 1  (=1: no stride, K not recoverable)
+ => whole-block re-randomization (the CLI default) destroys the K leak.
+
+ANSWER
+------------------------------------------------------------------------------
+ - From challenge_block.bin alone: K is NOT determinable (no residue signal at
+   any stride; K=11 looks like every other K and like pure random).
+ - K=11 is known only because the challenge told us; it is a secret credential.
+ - K leaks ONLY under multi-snapshot diffing of in-place writes (shown above),
+   which (a) needs >=2 images we do not have, and (b) is defended by the default
+   re-randomizing write. With our single snapshot, K stays hidden.
