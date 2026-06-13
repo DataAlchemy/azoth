@@ -23,6 +23,7 @@
 11. [How we tested that it is secure](#11-how-we-tested-that-it-is-secure)
 12. [Prior art and how azoth differs](#12-prior-art-and-how-azoth-differs)
 13. [Reproducing the results](#13-reproducing-the-results)
+14. [For reviewers — where to focus](#14-for-reviewers--where-to-focus)
 
 ---
 
@@ -549,3 +550,60 @@ python3 ../kpdc_reference.py
 Authoritative documents: the design spec is
 `_bmad-output/brainstorming/8pdc-spec-draft.md`; this file summarizes and extends it with the
 testing and rationale record.
+
+---
+
+## 14. For reviewers — where to focus
+
+The cryptographic risk here is **not** uniformly distributed. If you're reviewing this (thank
+you — please try to break it), separate the two layers; they need very different amounts of
+scrutiny.
+
+### Lower-risk: the per-payload confidentiality core
+
+The encryption of a single payload is a textbook composition of conservative, well-vetted
+primitives — **Argon2id** (KDF) → **SHAKE256** keystream → XOR → **HMAC-SHA256** (encrypt-then-MAC),
+with a fresh 128-bit salt per write and domain-separated subkeys. There is nothing novel in this
+layer. It is **not** where to spend time on primitive selection (AES-vs-ChaCha-style debates).
+
+Two caveats that nonetheless live in *this* layer and bound its real-world strength:
+
+- **Confidentiality is only as strong as `password entropy × KDF cost`.** The recognition token
+  and HMAC form an **offline verification oracle**: anyone holding the blob can test guesses
+  offline, gated solely by Argon2id. A weak password is brute-forceable — not because the cipher
+  is weak, but because that is the nature of password-based encryption. "The cipher is sound"
+  holds *only* for a strong password + heavy cost. This is the most likely real-world break, and
+  it has nothing to do with the deniability machinery.
+- **Standard primitives ≠ audited assembly.** The composition is hand-rolled and unaudited; a
+  subtle bug in key derivation, keystream generation, the MAC, salt/nonce handling, or the
+  bit-placement would dent confidentiality regardless of how good the primitives are.
+
+### Where the actual experimental surface is: the deniability machinery
+
+The novel, design-risk-concentrated part is everything that makes this *deniable*: the
+residue-class **plane** construction, the **indistinguishable-from-random** claim, the
+**unprovable-count** property, and the **multi-snapshot re-randomization**. This is what most
+needs expert eyes.
+
+### The three questions worth a reviewer's time
+
+1. **Does the deniability / indistinguishability actually hold** — under chosen-plaintext,
+   partial-credential (an adversary who knows `j` of the `K` passwords), and multi-snapshot
+   conditions? In particular, does anything leak the **payload count** or **`K`**?
+2. **Does the hand-rolled key / keystream / position derivation have an implementation bug** —
+   salt/nonce handling, domain separation, the bit-plane walk, the open-addressed plane lookup?
+3. **Is the offline-guess oracle the only practical attack**, or is there a cheaper distinguisher
+   or extraction we missed?
+
+### Suggested framing when requesting a review
+
+> "The confidentiality core is standard primitives in a textbook AE composition — I'm not asking
+> you to vet primitive choices. I'm asking: (1) does the deniability/indistinguishability
+> construction hold, (2) does the hand-rolled key/keystream/position derivation have a bug, and
+> (3) is the offline-guess oracle the only practical attack, or did I miss one?"
+
+Good venues: **[Cryptography Stack Exchange](https://crypto.stackexchange.com)** (scoped
+questions), **r/cryptography**, the **IACR ePrint archive** / **PETS** community for the deniable-
+storage angle, and a professional audit (Trail of Bits / NCC Group / Cure53 / Kudelski) for any
+"safe to actually rely on" verdict. Lead with the prior-art acknowledgment (§12) and the
+"experimental, please break this" framing — do not claim novelty or security.
