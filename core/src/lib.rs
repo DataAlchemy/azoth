@@ -25,6 +25,9 @@
 
 #![forbid(unsafe_code)]
 
+/// High-level create/write/read orchestration shared by all front-ends (CLI + GUI).
+pub mod app;
+
 use argon2::{Algorithm, Argon2, Params, Version};
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};

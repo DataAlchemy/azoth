@@ -15,11 +15,13 @@ jobs:
     runs-on: ubuntu-latest
     defaults:
       run:
-        working-directory: azoth
+        working-directory: core
     steps:
       - uses: actions/checkout@v4
 
-      # rustup honors azoth/rust-toolchain.toml (channel 1.96.0 + rustfmt/clippy).
+      # rustup honors core/rust-toolchain.toml (channel 1.96.0 + rustfmt/clippy).
+      # The Windows front-ends (cmd, win) need the Windows toolchain, so this Linux job covers
+      # the shared core library and the Linux CLI only.
       - name: Show toolchain
         run: rustc --version && cargo --version
 
@@ -29,20 +31,20 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            azoth/target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('azoth/Cargo.lock') }}
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
 
       - name: Format check
         run: cargo fmt --all -- --check
 
       - name: Clippy (deny warnings)
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy -p azoth -p azoth-cli --all-targets -- -D warnings
 
       - name: Build
-        run: cargo build --release
+        run: cargo build -p azoth -p azoth-cli --release
 
       - name: Test
-        run: cargo test --release
+        run: cargo test -p azoth --release
 
   python-reference:
     name: python reference self-test

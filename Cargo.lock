@@ -342,16 +342,36 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 name = "azoth"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "argon2",
- "clap",
  "getrandom 0.2.17",
- "hex",
  "hmac",
- "rpassword",
  "sha2",
  "sha3",
  "subtle",
+ "zeroize",
+]
+
+[[package]]
+name = "azoth-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "azoth",
+ "clap",
+ "hex",
+ "rpassword",
+ "zeroize",
+]
+
+[[package]]
+name = "azoth-cmd"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "azoth",
+ "clap",
+ "hex",
+ "rpassword",
  "zeroize",
 ]
 

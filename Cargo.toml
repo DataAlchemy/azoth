@@ -1,11 +1,19 @@
 [workspace]
 resolver = "2"
-members = ["azoth", "gui"]
-exclude = ["azoth/fuzz"]   # azoth/fuzz has its own [workspace]
+# core   = shared library (KPDC crypto + create/write/read app orchestration)
+# cli    = Linux/Unix command line (raw block-device support)
+# cmd    = Windows command line
+# win    = Windows GUI (egui)
+members = ["core", "cli", "cmd", "win"]
+exclude = ["core/fuzz"]   # core/fuzz has its own [workspace]
+# Plain `cargo build`/`test` operate on the core library (where the tests live). The three
+# front-ends are platform-specific and built explicitly — `cargo build -p azoth-cli` (Linux),
+# `-p azoth-cmd` (Windows CLI), `-p azoth-gui` (Windows GUI). The two CLIs share the bin name
+# `azoth`, so they are intentionally not in the default set (building both at once would collide).
+default-members = ["core"]
 
-# Member crates declare their own [profile.release]; in a workspace only the root's
-# profiles apply, so mirror azoth's release settings here (keeps the lib/CLI optimized
-# and gives the GUI release build the same LTO).
+# Only the workspace root's profiles apply (member profiles are ignored), so the release
+# settings live here — they keep the lib/CLIs optimized and give the GUI the same LTO.
 [profile.release]
 opt-level = 3
 lto = true

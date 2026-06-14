@@ -59,7 +59,7 @@ looks like noise.*
 ## ✦ Try it (Rust — the real implementation)
 
 ```bash
-cd azoth && cargo build --release
+cargo build --release -p azoth-cli        # the Linux/Unix CLI
 BIN=./target/release/azoth
 
 K=$($BIN prime 419)                                   # a good K: prime, coprime to 8
@@ -125,8 +125,8 @@ containers are *not* wire-compatible (different KDF and slot walk); each reads o
 ## ✦ Native GUI (Windows)
 
 A small native-Windows front-end (egui / [eframe](https://crates.io/crates/eframe)) lives in
-[`gui/`](gui/): **Create · Write · Read** tabs, a shared inputs block (container file, `K`, KDF
-cost), and a status-log pane. It calls the same `azoth` library — **no new crypto** — and mirrors
+[`win/`](win/): **Create · Write · Read** tabs, a shared inputs block (container file, `K`, KDF
+cost), and a status-log pane. It calls the shared `azoth` core — **no new crypto** — and mirrors
 the CLI's warnings (non-prime `K`, custom KDF cost, re-randomize data-loss). Argon2id runs on a
 worker thread, so the window never freezes.
 
@@ -143,9 +143,10 @@ $env:Path = "$msys;$env:Path"
 $env:CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER    = "$msys\gcc.exe"
 $env:CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUSTFLAGS = '-Clink-self-contained=no'
 
-cargo run   -p azoth-gui                   # build & launch
+cargo run   -p azoth-gui                   # build & launch the GUI
 cargo build -p azoth-gui --release         # -> target/release/azoth-gui.exe
-cargo test  -p azoth-gui --release         # create -> 2 writes -> read-back round-trip
+cargo build -p azoth-cmd --release         # the Windows CLI (-> target/release/azoth.exe)
+cargo test  -p azoth     --release         # shared-core round-trip: create -> 2 writes -> read-back
 ```
 
 > Don't build on a **network / UNC drive** — the MinGW linker can't use UNC paths and Windows
@@ -156,8 +157,10 @@ cargo test  -p azoth-gui --release         # create -> 2 writes -> read-back rou
 
 | Path | What |
 |---|---|
-| [`azoth/`](azoth/) | **The Rust implementation** — `azoth` library crate + CLI (`create`/`write`/`read`). The real, fast one. |
-| [`gui/`](gui/) | **Native Windows GUI** (egui) — a Create/Write/Read front-end over the `azoth` library. |
+| [`core/`](core/) | **Shared core** — the `azoth` library crate: KPDC crypto + the create/write/read app orchestration every front-end calls. The real, fast one. |
+| [`cli/`](cli/) | **Linux/Unix CLI** (`azoth`) — create/write/read, with raw block-device support. |
+| [`cmd/`](cmd/) | **Windows CLI** (`azoth`) — the same model, Windows-tailored (no raw-device handling). |
+| [`win/`](win/) | **Windows GUI** (egui) — a Create/Write/Read front-end over the core. |
 | [`TECHNICAL_DETAILS.md`](TECHNICAL_DETAILS.md) | **In-depth write-up & self-review** — full construction, rationale, rejected designs, and exactly how we tested security (statistical suite + KAT + fuzz + a 4-round multi-agent adversarial review). |
 | [`kpdc_reference.py`](kpdc_reference.py) | The **readable reference** (Python stdlib, no deps). Clarity over speed; mirrors the spec. |
 | [`_bmad-output/.../8pdc-spec-draft.md`](_bmad-output/brainstorming/8pdc-spec-draft.md) | **The design spec (v0.3)** — threat model, algorithms, honest weaknesses from an adversarial review. |

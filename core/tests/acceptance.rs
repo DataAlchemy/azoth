@@ -8,8 +8,8 @@
 //! 3. Read each back with its password — both round-trip.
 //! 4. A wrong password → "no payload" (NotFound).
 
+use azoth::app::{create_container, read_payload, write_payload, Kdf, ReadOutcome};
 use azoth::next_prime_coprime8;
-use azoth_gui::{create_container, read_payload, write_payload, Kdf, ReadOutcome};
 
 /// Removes the temp container even if an assertion panics.
 struct TempFile(String);
@@ -47,8 +47,17 @@ fn acceptance_two_secrets_roundtrip() {
     );
 
     // 2. write two secrets, re-randomize ON, all-keys confirmed
-    write_payload(&path, "alpha-pass", b"treaty at dawn", &[], k, kdf, true, true)
-        .expect("first write");
+    write_payload(
+        &path,
+        "alpha-pass",
+        b"treaty at dawn",
+        &[],
+        k,
+        kdf,
+        true,
+        true,
+    )
+    .expect("first write");
     write_payload(
         &path,
         "beta-pass",
@@ -91,7 +100,13 @@ fn rerandomize_requires_all_keys() {
     create_container(&path, 4096, 419, Kdf::RECOMMENDED).expect("create");
 
     let err = write_payload(
-        &path, "pw", b"x", &[], 419, Kdf::RECOMMENDED, true, // re-randomize
+        &path,
+        "pw",
+        b"x",
+        &[],
+        419,
+        Kdf::RECOMMENDED,
+        true,  // re-randomize
         false, // but all-keys NOT confirmed
     )
     .expect_err("must refuse without all-keys");

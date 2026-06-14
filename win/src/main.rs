@@ -9,7 +9,7 @@
 //! write/read take ~1s+ (re-randomize does several), so every operation runs on a worker
 //! thread and the result is delivered back over an mpsc channel; `update()` never blocks.
 
-use azoth_gui::{
+use azoth::app::{
     create_container, parse_size, read_payload, write_payload, Kdf, ReadOutcome, REC_ITERS,
     REC_MEM_MIB,
 };
@@ -67,7 +67,11 @@ fn install_symbol_font(ctx: &egui::Context) {
                 .font_data
                 .insert("symbols".to_owned(), egui::FontData::from_owned(bytes));
             for fam in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-                fonts.families.entry(fam).or_default().push("symbols".to_owned());
+                fonts
+                    .families
+                    .entry(fam)
+                    .or_default()
+                    .push("symbols".to_owned());
             }
             break;
         }
@@ -297,7 +301,9 @@ impl App {
         let plaintext: Vec<u8> = if !data_file.is_empty() {
             match std::fs::read(&data_file) {
                 Ok(b) => b,
-                Err(e) => return self.log_line(&format!("error: reading data file {data_file}: {e}")),
+                Err(e) => {
+                    return self.log_line(&format!("error: reading data file {data_file}: {e}"))
+                }
             }
         } else {
             self.plaintext.clone().into_bytes()
@@ -557,8 +563,12 @@ impl App {
                         .as_ref()
                         .map(|b| std::fs::write(&p, b.as_slice()));
                     match res {
-                        Some(Ok(())) => self.log_line(&format!("saved decrypted bytes to {}", p.display())),
-                        Some(Err(e)) => self.log_line(&format!("error: saving {}: {e}", p.display())),
+                        Some(Ok(())) => {
+                            self.log_line(&format!("saved decrypted bytes to {}", p.display()))
+                        }
+                        Some(Err(e)) => {
+                            self.log_line(&format!("error: saving {}: {e}", p.display()))
+                        }
                         None => {}
                     }
                 }
@@ -623,44 +633,46 @@ impl eframe::App for App {
             .stroke(egui::Stroke::new(1.0, BRASS_DIM))
             .rounding(egui::Rounding::same(4.0))
             .inner_margin(egui::Margin::same(14.0));
-        egui::CentralPanel::default().frame(central).show(ctx, |ui| {
-            ui.heading(egui::RichText::new("⚗  A Z O T H").color(GOLD));
-            ui.label(
-                egui::RichText::new("K-Plane Deniable Container  ·  solve et coagula")
-                    .italics()
-                    .color(GOLD.linear_multiply(0.85)),
-            );
-            ui.add_space(2.0);
-            ui.label(
+        egui::CentralPanel::default()
+            .frame(central)
+            .show(ctx, |ui| {
+                ui.heading(egui::RichText::new("⚗  A Z O T H").color(GOLD));
+                ui.label(
+                    egui::RichText::new("K-Plane Deniable Container  ·  solve et coagula")
+                        .italics()
+                        .color(GOLD.linear_multiply(0.85)),
+                );
+                ui.add_space(2.0);
+                ui.label(
                 egui::RichText::new(
                     "One block of noise, many secrets. K and the KDF cost are the credential — \
                      never stored, so supply them every time.",
                 )
                 .color(PARCH_DIM),
             );
-            ui.separator();
+                ui.separator();
 
-            ui.horizontal(|ui| {
-                ui.selectable_value(&mut self.tab, Tab::Create, "Create");
-                ui.selectable_value(&mut self.tab, Tab::Write, "Write");
-                ui.selectable_value(&mut self.tab, Tab::Read, "Read");
-                if self.busy {
-                    ui.separator();
-                    ui.spinner();
-                    ui.label("working… (Argon2id is deliberately slow)");
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut self.tab, Tab::Create, "Create");
+                    ui.selectable_value(&mut self.tab, Tab::Write, "Write");
+                    ui.selectable_value(&mut self.tab, Tab::Read, "Read");
+                    if self.busy {
+                        ui.separator();
+                        ui.spinner();
+                        ui.label("working… (Argon2id is deliberately slow)");
+                    }
+                });
+                ui.separator();
+
+                self.ui_shared(ui);
+                ui.separator();
+
+                match self.tab {
+                    Tab::Create => self.ui_create(ui),
+                    Tab::Write => self.ui_write(ui),
+                    Tab::Read => self.ui_read(ui),
                 }
             });
-            ui.separator();
-
-            self.ui_shared(ui);
-            ui.separator();
-
-            match self.tab {
-                Tab::Create => self.ui_create(ui),
-                Tab::Write => self.ui_write(ui),
-                Tab::Read => self.ui_read(ui),
-            }
-        });
 
         // Keep repainting while a job is in flight so the poll above keeps running.
         if self.busy {
