@@ -1,0 +1,11 @@
+[workspace]
+resolver = "2"
+members = ["azoth", "gui"]
+exclude = ["azoth/fuzz"]   # azoth/fuzz has its own [workspace]
+
+# Member crates declare their own [profile.release]; in a workspace only the root's
+# profiles apply, so mirror azoth's release settings here (keeps the lib/CLI optimized
+# and gives the GUI release build the same LTO).
+[profile.release]
+opt-level = 3
+lto = true

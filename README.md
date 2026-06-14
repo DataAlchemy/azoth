@@ -122,11 +122,42 @@ The **Python reference** (`kpdc_reference.py`) mirrors this for readability — 
 `python3 kpdc_reference.py` for the same self-test. **Note:** the Python and Rust
 containers are *not* wire-compatible (different KDF and slot walk); each reads only its own.
 
+## ✦ Native GUI (Windows)
+
+A small native-Windows front-end (egui / [eframe](https://crates.io/crates/eframe)) lives in
+[`gui/`](gui/): **Create · Write · Read** tabs, a shared inputs block (container file, `K`, KDF
+cost), and a status-log pane. It calls the same `azoth` library — **no new crypto** — and mirrors
+the CLI's warnings (non-prime `K`, custom KDF cost, re-randomize data-loss). Argon2id runs on a
+worker thread, so the window never freezes.
+
+**Build with Rust's GNU toolchain (no Visual Studio needed):**
+
+```powershell
+rustup toolchain install stable-x86_64-pc-windows-gnu
+
+# Modern windows-sys crates use raw-dylib, so building for windows-gnu needs a complete
+# MinGW-w64 — specifically the GNU assembler `as.exe`, which the toolchain's bundled linker
+# does NOT include. e.g. via MSYS2:  pacman -S mingw-w64-x86_64-toolchain
+$msys = 'C:\msys64\mingw64\bin'
+$env:Path = "$msys;$env:Path"
+$env:CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER    = "$msys\gcc.exe"
+$env:CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUSTFLAGS = '-Clink-self-contained=no'
+
+cargo run   -p azoth-gui                   # build & launch
+cargo build -p azoth-gui --release         # -> target/release/azoth-gui.exe
+cargo test  -p azoth-gui --release         # create -> 2 writes -> read-back round-trip
+```
+
+> Don't build on a **network / UNC drive** — the MinGW linker can't use UNC paths and Windows
+> blocks executing build scripts from a share. Work from a local copy, or point
+> `CARGO_TARGET_DIR` at a local disk.
+
 ## ✦ Map of the repo
 
 | Path | What |
 |---|---|
 | [`azoth/`](azoth/) | **The Rust implementation** — `azoth` library crate + CLI (`create`/`write`/`read`). The real, fast one. |
+| [`gui/`](gui/) | **Native Windows GUI** (egui) — a Create/Write/Read front-end over the `azoth` library. |
 | [`TECHNICAL_DETAILS.md`](TECHNICAL_DETAILS.md) | **In-depth write-up & self-review** — full construction, rationale, rejected designs, and exactly how we tested security (statistical suite + KAT + fuzz + a 4-round multi-agent adversarial review). |
 | [`kpdc_reference.py`](kpdc_reference.py) | The **readable reference** (Python stdlib, no deps). Clarity over speed; mirrors the spec. |
 | [`_bmad-output/.../8pdc-spec-draft.md`](_bmad-output/brainstorming/8pdc-spec-draft.md) | **The design spec (v0.3)** — threat model, algorithms, honest weaknesses from an adversarial review. |

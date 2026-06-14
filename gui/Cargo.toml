@@ -1,0 +1,24 @@
+[package]
+name = "azoth-gui"
+version = "0.1.0"
+edition = "2021"
+description = "Native Windows GUI front-end for the azoth deniable container (KPDC)"
+license = "MIT"
+
+# Core crypto-orchestration logic lives in a library target so the acceptance test can
+# drive the exact same code path the GUI calls (no egui in the loop).
+[lib]
+name = "azoth_gui"
+path = "src/core.rs"
+
+[[bin]]
+name = "azoth-gui"
+path = "src/main.rs"
+
+[dependencies]
+azoth = { path = "../azoth" }   # the library crate already in this repo — NO new crypto here
+# glow (OpenGL) backend only: a small native GUI doesn't need wgpu/DirectX, and the wgpu
+# stack (naga, hassle-rs/DXC, ash) is heavy and fragile to build under the windows-gnu toolchain.
+eframe = { version = "0.28", default-features = false, features = ["glow", "default_fonts"] }
+rfd = "0.14"                     # native file open/save dialogs
+zeroize = "1"                    # hold library-returned secrets in Zeroizing
