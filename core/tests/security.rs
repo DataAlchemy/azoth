@@ -2,7 +2,7 @@
 //!
 //! Cost note: tests whose property is independent of KDF strength (statistical
 //! distribution, panic-safety, false-positive rate over many guesses) use
-//! `KdfParams::FAST_TEST` so they can run thousands of evaluations. The KAT and the
+//! `KdfParams::INSECURE_FAST_TEST` so they can run thousands of evaluations. The KAT and the
 //! functional multi-key/re-randomize tests run at `KdfParams::RECOMMENDED` (the real
 //! default) with small K/maxprobe to keep the Argon2 call count low.
 
@@ -128,7 +128,7 @@ fn serial_correlation(block: &[u8]) -> f64 {
 }
 
 const REC: KdfParams = KdfParams::RECOMMENDED;
-const FAST: KdfParams = KdfParams::FAST_TEST;
+const FAST: KdfParams = KdfParams::INSECURE_FAST_TEST;
 
 // =========================================================================== //
 //  Indistinguishability (the headline property)

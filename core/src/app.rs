@@ -20,6 +20,12 @@ use zeroize::Zeroizing;
 pub const REC_MEM_MIB: u32 = 256;
 pub const REC_ITERS: u32 = 3;
 
+/// Hard floor for KDF memory cost (the OWASP Argon2id minimum). The memory-hard gate is the
+/// only defense against offline guessing of the verification oracle; below this it is too
+/// cheap to brute-force, so every front-end refuses it. (The library's hidden
+/// `INSECURE_FAST_TEST` cost is for tests only and bypasses this front-end policy.)
+pub const MIN_KDF_MEM_MIB: u32 = 19;
+
 /// Decoy-storage tip printed/shown after `create`.
 pub const CREATE_TIP: &str = "\
 Tip: a brand-new container is pure noise. Before storing your real secret,
@@ -57,10 +63,17 @@ impl Kdf {
         self.mem_mib != REC_MEM_MIB || self.iters != REC_ITERS
     }
 
-    /// Reject zero cost.
+    /// Reject zero iterations and memory below the security floor ([`MIN_KDF_MEM_MIB`]).
     pub fn validate(self) -> Result<(), String> {
-        if self.mem_mib == 0 || self.iters == 0 {
-            return Err("KDF memory (MiB) and iterations must each be >= 1".to_string());
+        if self.iters == 0 {
+            return Err("KDF iterations must be >= 1".to_string());
+        }
+        if self.mem_mib < MIN_KDF_MEM_MIB {
+            return Err(format!(
+                "KDF memory {} MiB is below the {} MiB minimum (OWASP Argon2id floor); a weaker \
+                 gate makes offline guessing of the verification oracle cheap. Recommended is {} MiB.",
+                self.mem_mib, MIN_KDF_MEM_MIB, REC_MEM_MIB
+            ));
         }
         Ok(())
     }
@@ -167,10 +180,12 @@ pub fn write_block(
                     .to_string(),
             );
         }
-        let mut payloads: Vec<(String, Zeroizing<Vec<u8>>)> = Vec::new();
+        // Keep the recovered password + plaintext copies in Zeroizing so they wipe on drop.
+        #[allow(clippy::type_complexity)]
+        let mut payloads: Vec<(Zeroizing<String>, Zeroizing<Vec<u8>>)> = Vec::new();
         for q in known {
             match c.read(q, maxprobe) {
-                Some(pt) => payloads.push((q.clone(), pt)),
+                Some(pt) => payloads.push((Zeroizing::new(q.clone()), pt)),
                 None => {
                     return Err(
                         "a known password didn't decrypt any payload (wrong password, or wrong \
@@ -181,7 +196,10 @@ pub fn write_block(
             }
         }
         payloads.retain(|(p, _)| p.as_str() != pw);
-        payloads.push((pw.to_string(), Zeroizing::new(plaintext.to_vec())));
+        payloads.push((
+            Zeroizing::new(pw.to_string()),
+            Zeroizing::new(plaintext.to_vec()),
+        ));
         let refs: Vec<(&str, &[u8])> = payloads
             .iter()
             .map(|(p, d)| (p.as_str(), d.as_slice()))

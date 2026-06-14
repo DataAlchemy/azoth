@@ -5,7 +5,7 @@
 //! crypto here**. `K` and the KDF cost are part of the credential and are never stored; supply
 //! them every time.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use azoth::app::{self, Kdf, ReadOutcome};
 use azoth::{next_prime_coprime8, KdfParams, Kpdc};
 use clap::{Args, Parser, Subcommand};
@@ -199,22 +199,52 @@ fn size_parser(s: &str) -> std::result::Result<usize, String> {
     app::parse_size(s)
 }
 
-fn read_input(path: &str) -> Result<Vec<u8>> {
+/// Read the plaintext to be written. Returned in `Zeroizing` so the secret is wiped from the
+/// CLI's memory on drop (the library zeroizes its own copies).
+fn read_input(path: &str) -> Result<Zeroizing<Vec<u8>>> {
     if path == "-" {
-        let mut buf = Vec::new();
+        let mut buf = Zeroizing::new(Vec::new());
         std::io::stdin().read_to_end(&mut buf).context("stdin")?;
         Ok(buf)
     } else {
-        std::fs::read(path).with_context(|| format!("reading {}", path))
+        Ok(Zeroizing::new(
+            std::fs::read(path).with_context(|| format!("reading {}", path))?,
+        ))
     }
 }
 
 /// Write via a temp file + atomic rename so a crash can't corrupt the container.
-/// (Rust's `fs::rename` replaces the destination atomically on Windows.)
+///
+/// The temp file uses a random, unpredictable name and is created with `create_new`
+/// (refuses to follow or overwrite an existing path), so a pre-planted file/symlink cannot
+/// redirect the write. It holds the full re-randomized container, so it is removed on any
+/// failure. (`fs::rename` replaces the destination atomically on Windows.)
 fn write_atomic(path: &str, data: &[u8]) -> Result<()> {
-    let tmp = format!("{}.tmp.{}", path, std::process::id());
-    std::fs::write(&tmp, data).with_context(|| format!("writing {}", tmp))?;
-    std::fs::rename(&tmp, path).with_context(|| format!("renaming into {}", path))?;
+    let mut rnd = [0u8; 12];
+    getrandom::getrandom(&mut rnd)
+        .map_err(|e| anyhow!("gathering randomness for temp name: {e}"))?;
+    let tmp = format!("{}.tmp.{}", path, hex::encode(rnd));
+
+    let attempt = (|| -> Result<()> {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+            .with_context(|| format!("creating temp file {}", tmp))?;
+        f.write_all(data)
+            .with_context(|| format!("writing {}", tmp))?;
+        f.sync_all()
+            .with_context(|| format!("flushing {} to disk", tmp))?;
+        Ok(())
+    })();
+    if let Err(e) = attempt {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp); // don't leave the container's plaintext-equivalent behind
+        return Err(e).with_context(|| format!("renaming into {}", path));
+    }
     Ok(())
 }
 

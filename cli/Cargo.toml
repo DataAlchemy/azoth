@@ -17,3 +17,4 @@ anyhow = "1"
 rpassword = "7"
 zeroize = "1"
 hex = "0.4"
+getrandom = "0.2"               # unpredictable temp-file names for atomic writes

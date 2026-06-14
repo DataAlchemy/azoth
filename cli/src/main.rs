@@ -5,7 +5,7 @@
 //! orchestration is shared with the GUI and Windows CLI via `azoth::app`; this binary adds arg
 //! parsing, no-echo password prompts, raw block-device support (Unix), and atomic writes.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use azoth::app::{self, Kdf, ReadOutcome};
 use azoth::{next_prime_coprime8, KdfParams, Kpdc};
 use clap::{Args, Parser, Subcommand};
@@ -26,7 +26,7 @@ struct Cli {
 /// KDF cost — must match between write and read (it's part of the credential, not stored).
 #[derive(Args, Clone, Copy)]
 struct KdfArgs {
-    /// Argon2id memory cost in MiB (default = recommended).
+    /// Argon2id memory cost in MiB (default = recommended; the floor is enforced by the core).
     #[arg(long, default_value_t = app::REC_MEM_MIB)]
     kdf_mem_mib: u32,
     /// Argon2id iterations (passes).
@@ -138,6 +138,7 @@ fn main() -> Result<()> {
                     }
                 }
             }
+            // K must be odd (coprime to 8) — now a hard error in the core, not just a warning.
             let bytes = app::create_block(size, k, Kdf::RECOMMENDED).map_err(anyhow::Error::msg)?;
             write_target(&out, &bytes, raw)?;
             eprintln!(
@@ -162,13 +163,13 @@ fn main() -> Result<()> {
             kdf,
         } => {
             let kdf = kdf.to_kdf();
-            kdf.validate().map_err(anyhow::Error::msg)?;
+            kdf.validate().map_err(anyhow::Error::msg)?; // enforces the KDF memory floor
             warn_if_bad_k(k);
             warn_if_custom_kdf(kdf);
             let raw = raw || is_block_device(&file);
             let pw = resolve_password(password)?;
             let block = std::fs::read(&file).with_context(|| format!("reading {}", file))?;
-            let plaintext = read_input(&data)?;
+            let plaintext = read_input(&data)?; // Zeroizing
             let (new_block, log) = app::write_block(
                 block,
                 &pw,
@@ -239,21 +240,58 @@ fn size_parser(s: &str) -> std::result::Result<usize, String> {
     app::parse_size(s)
 }
 
-fn read_input(path: &str) -> Result<Vec<u8>> {
+/// Read the plaintext to be written. Returned in `Zeroizing` so the secret is wiped from the
+/// CLI's memory on drop (the library zeroizes its own copies).
+fn read_input(path: &str) -> Result<Zeroizing<Vec<u8>>> {
     if path == "-" {
-        let mut buf = Vec::new();
+        let mut buf = Zeroizing::new(Vec::new());
         std::io::stdin().read_to_end(&mut buf).context("stdin")?;
         Ok(buf)
     } else {
-        std::fs::read(path).with_context(|| format!("reading {}", path))
+        Ok(Zeroizing::new(
+            std::fs::read(path).with_context(|| format!("reading {}", path))?,
+        ))
     }
 }
 
 /// Write via a temp file + atomic rename so a crash can't corrupt the container.
+/// (Only valid for regular files — see `write_target` for raw block devices.)
+///
+/// The temp file uses a random, unpredictable name and is created with `create_new`
+/// (`O_EXCL|O_CREAT`, which refuses to follow or overwrite an existing path — so a pre-planted
+/// symlink cannot redirect the write) and owner-only `0o600` permissions. It holds the full
+/// re-randomized container, so it is removed on any failure.
 fn write_atomic(path: &str, data: &[u8]) -> Result<()> {
-    let tmp = format!("{}.tmp.{}", path, std::process::id());
-    std::fs::write(&tmp, data).with_context(|| format!("writing {}", tmp))?;
-    std::fs::rename(&tmp, path).with_context(|| format!("renaming into {}", path))?;
+    let mut rnd = [0u8; 12];
+    getrandom::getrandom(&mut rnd)
+        .map_err(|e| anyhow!("gathering randomness for temp name: {e}"))?;
+    let tmp = format!("{}.tmp.{}", path, hex::encode(rnd));
+
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let attempt = (|| -> Result<()> {
+        let mut f = opts
+            .open(&tmp)
+            .with_context(|| format!("creating temp file {}", tmp))?;
+        f.write_all(data)
+            .with_context(|| format!("writing {}", tmp))?;
+        f.sync_all()
+            .with_context(|| format!("flushing {} to disk", tmp))?;
+        Ok(())
+    })();
+    if let Err(e) = attempt {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp); // don't leave the container's plaintext-equivalent behind
+        return Err(e).with_context(|| format!("renaming into {}", path));
+    }
     Ok(())
 }
 
@@ -263,10 +301,16 @@ fn write_target(path: &str, data: &[u8], raw: bool) -> Result<()> {
     if !raw {
         return write_atomic(path, data);
     }
-    let mut f = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false)
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).write(true).truncate(false);
+    #[cfg(unix)]
+    {
+        // Owner-only if we end up creating a regular file; a no-op on an existing device
+        // node (whose permissions are managed in /dev). Don't rely on umask.
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts
         .open(path)
         .with_context(|| format!("opening {} for raw write", path))?;
     f.write_all(data)
