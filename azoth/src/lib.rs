@@ -61,9 +61,12 @@ impl KdfParams {
         iters: 3,
         lanes: 1,
     };
-    /// Low cost for high-volume statistical/fuzz tests ONLY (output distribution and
-    /// panic-safety are independent of KDF cost). Never use for real data.
-    pub const FAST_TEST: KdfParams = KdfParams {
+    /// **INSECURE.** Low cost for high-volume statistical/fuzz tests ONLY (output
+    /// distribution and panic-safety are independent of KDF cost). The memory-hard
+    /// gate is the whole defense against offline guessing — this value defeats it.
+    /// Never use for real data. Hidden from docs and named to make misuse obvious.
+    #[doc(hidden)]
+    pub const INSECURE_FAST_TEST: KdfParams = KdfParams {
         mem_kib: 8_192,
         iters: 1,
         lanes: 1,
@@ -79,6 +82,7 @@ impl Default for KdfParams {
 #[derive(Debug)]
 pub enum Error {
     InvalidK { k: u64, nbits: u64 },
+    NonCoprimeK { k: u64 },
     ContainerFull,
     PayloadTooLarge { need_bits: u64, plane_bits: u64 },
     PayloadTooLong { len: usize },
@@ -94,6 +98,13 @@ impl std::fmt::Display for Error {
                 f,
                 "invalid K={}: must satisfy 2 <= K <= block bit-count ({})",
                 k, nbits
+            ),
+            Error::NonCoprimeK { k } => write!(
+                f,
+                "invalid K={}: must be coprime to 8 (i.e. odd) or the bit-planes collapse onto \
+                 fixed within-byte positions and the container is no longer indistinguishable \
+                 from random — use `azoth prime <n>` for a good K",
+                k
             ),
             Error::ContainerFull => write!(f, "container full: no free plane within probe bound"),
             Error::PayloadTooLarge {
@@ -290,6 +301,14 @@ impl Kpdc {
         if k < 2 || k > nbits {
             return Err(Error::InvalidK { k, nbits });
         }
+        // K MUST be coprime to 8 (i.e. odd). Otherwise gcd(K,8) > 1 and each plane
+        // touches only a fixed subset of the 8 within-byte bit positions, which a
+        // password-less adversary can detect on a single snapshot — voiding the
+        // headline indistinguishability property. Enforced here, not just warned in
+        // the CLI, so direct library callers cannot silently get an insecure container.
+        if k.is_multiple_of(2) {
+            return Err(Error::NonCoprimeK { k });
+        }
         validate_kdf(kdf)?;
         Ok(Kpdc { block, k, kdf })
     }
@@ -299,6 +318,10 @@ impl Kpdc {
         let nbits = (size as u64) * 8;
         if k < 2 || k > nbits {
             return Err(Error::InvalidK { k, nbits });
+        }
+        // Coprime-to-8 (odd) is mandatory for indistinguishability — see `from_bytes`.
+        if k.is_multiple_of(2) {
+            return Err(Error::NonCoprimeK { k });
         }
         validate_kdf(kdf)?;
         let mut block = vec![0u8; size];
@@ -569,9 +592,9 @@ mod tests {
     // Headline functional tests run at the REAL recommended cost (small K/maxprobe
     // keep the Argon2 call count low so they finish in a few seconds each).
     const REC: KdfParams = KdfParams::RECOMMENDED;
-    // FAST_TEST is used only where a test needs many KDF evals and the property under
-    // test (logic/invariants) is independent of KDF cost.
-    const FAST: KdfParams = KdfParams::FAST_TEST;
+    // INSECURE_FAST_TEST is used only where a test needs many KDF evals and the property
+    // under test (logic/invariants) is independent of KDF cost.
+    const FAST: KdfParams = KdfParams::INSECURE_FAST_TEST;
     const MP: usize = 2;
     const K: u64 = 11;
     const SZ: usize = 8192;
@@ -597,6 +620,36 @@ mod tests {
             Err(Error::InvalidK { .. })
         ));
         // K larger than the bit-count is also rejected (would underflow plane math)
+        assert!(matches!(
+            Kpdc::create(2, 100, FAST),
+            Err(Error::InvalidK { .. })
+        ));
+    }
+
+    #[test]
+    fn non_coprime_k_is_rejected() {
+        // Even K (gcd(K,8) > 1) collapses planes onto fixed bit positions — must be a
+        // hard error in BOTH constructors, not merely a CLI warning. (DEN-1.)
+        for bad in [2u64, 4, 8, 16, 256, 512] {
+            assert!(
+                matches!(
+                    Kpdc::create(8192, bad, FAST),
+                    Err(Error::NonCoprimeK { .. })
+                ),
+                "create did not reject even K={bad}"
+            );
+            assert!(
+                matches!(
+                    Kpdc::from_bytes(vec![0u8; 1024], bad, FAST),
+                    Err(Error::NonCoprimeK { .. })
+                ),
+                "from_bytes did not reject even K={bad}"
+            );
+        }
+        // Odd K (coprime to 8) is accepted, prime or not.
+        assert!(Kpdc::create(8192, 11, FAST).is_ok());
+        assert!(Kpdc::create(8192, 9, FAST).is_ok()); // odd composite still spreads bits
+                                                      // The range check takes precedence over the coprimality check.
         assert!(matches!(
             Kpdc::create(2, 100, FAST),
             Err(Error::InvalidK { .. })

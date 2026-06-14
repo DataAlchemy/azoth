@@ -119,6 +119,16 @@ class KPDC:
             raise ValueError(
                 "invalid K=%d: must satisfy 2 <= K <= block bit-count (%d)" % (K, self.nbits)
             )
+        # K MUST be coprime to 8 (i.e. odd): otherwise gcd(K,8) > 1 and each plane
+        # touches only fixed within-byte bit positions, which a password-less adversary
+        # can detect on a single snapshot — voiding indistinguishability. (Mirrors the
+        # Rust core's hard check; an odd prime via next_prime_coprime8 is recommended.)
+        if K % 2 == 0:
+            raise ValueError(
+                "invalid K=%d: must be coprime to 8 (odd) or the planes collapse onto fixed "
+                "bit positions and the container is no longer indistinguishable from random "
+                "(use next_prime_coprime8)" % K
+            )
         self.K = K
 
     @classmethod

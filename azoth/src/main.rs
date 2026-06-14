@@ -23,6 +23,10 @@ struct Cli {
 /// Recommended Argon2id cost (the default). Mirrors KdfParams::RECOMMENDED.
 const REC_MEM_MIB: u32 = 256;
 const REC_ITERS: u32 = 3;
+/// Hard floor for memory cost. The memory-hard gate is the only defense against
+/// offline guessing of the verification oracle; below the OWASP Argon2id minimum
+/// (~19 MiB) it is too cheap to brute-force, so the CLI refuses it outright.
+const MIN_KDF_MEM_MIB: u32 = 19;
 
 /// KDF cost — must match between write and read (it's part of the credential, not stored).
 #[derive(Args, Clone, Copy)]
@@ -36,8 +40,18 @@ struct KdfArgs {
 }
 impl KdfArgs {
     fn validate(&self) -> Result<()> {
-        if self.kdf_mem_mib == 0 || self.kdf_iters == 0 {
-            bail!("--kdf-mem-mib and --kdf-iters must each be >= 1");
+        if self.kdf_iters == 0 {
+            bail!("--kdf-iters must be >= 1");
+        }
+        if self.kdf_mem_mib < MIN_KDF_MEM_MIB {
+            bail!(
+                "--kdf-mem-mib {} is below the {} MiB minimum (OWASP Argon2id floor); a weaker \
+                 gate makes offline guessing of the verification oracle cheap. The recommended \
+                 cost is {} MiB.",
+                self.kdf_mem_mib,
+                MIN_KDF_MEM_MIB,
+                REC_MEM_MIB
+            );
         }
         Ok(())
     }
@@ -207,10 +221,14 @@ fn main() -> Result<()> {
                     );
                 }
                 // Recover every existing payload we're told about (all must decrypt), then rebuild.
-                let mut payloads: Vec<(String, Vec<u8>)> = Vec::new();
+                // Plaintext and password copies are kept in Zeroizing so they are wiped on drop.
+                #[allow(clippy::type_complexity)]
+                let mut payloads: Vec<(Zeroizing<String>, Zeroizing<Vec<u8>>)> = Vec::new();
                 for q in &known {
                     match c.read(q, maxprobe) {
-                        Some(pt) => payloads.push((q.clone(), pt.to_vec())),
+                        Some(pt) => {
+                            payloads.push((Zeroizing::new(q.clone()), Zeroizing::new(pt.to_vec())))
+                        }
                         None => bail!(
                             "a --known password did not decrypt any payload (wrong password, or wrong \
                              K / KDF cost). Aborting so re-randomize does not destroy data."
@@ -218,7 +236,10 @@ fn main() -> Result<()> {
                     }
                 }
                 payloads.retain(|(p, _)| p.as_str() != pw.as_str());
-                payloads.push((pw.to_string(), plaintext.clone()));
+                payloads.push((
+                    Zeroizing::new(pw.to_string()),
+                    Zeroizing::new(plaintext.to_vec()),
+                ));
                 let refs: Vec<(&str, &[u8])> = payloads
                     .iter()
                     .map(|(p, d)| (p.as_str(), d.as_slice()))
@@ -325,22 +346,58 @@ fn size_parser(s: &str) -> std::result::Result<usize, String> {
     parse_size(s).map_err(|e| e.to_string())
 }
 
-fn read_input(path: &str) -> Result<Vec<u8>> {
+/// Read the plaintext to be written. Returned in `Zeroizing` so the secret is
+/// wiped from the CLI's memory on drop (the library zeroizes its own copies).
+fn read_input(path: &str) -> Result<Zeroizing<Vec<u8>>> {
     if path == "-" {
-        let mut buf = Vec::new();
+        let mut buf = Zeroizing::new(Vec::new());
         std::io::stdin().read_to_end(&mut buf).context("stdin")?;
         Ok(buf)
     } else {
-        std::fs::read(path).with_context(|| format!("reading {}", path))
+        Ok(Zeroizing::new(
+            std::fs::read(path).with_context(|| format!("reading {}", path))?,
+        ))
     }
 }
 
 /// Write via a temp file + atomic rename so a crash can't corrupt the container.
 /// (Only valid for regular files — see `write_target` for raw block devices.)
+///
+/// The temp file is created with a random, unpredictable name via `create_new`
+/// (`O_EXCL|O_CREAT`, which refuses to follow or overwrite an existing path — so a
+/// pre-planted symlink cannot redirect the write) and owner-only `0o600` permissions.
+/// It holds the full re-randomized container, so it is removed on any failure.
 fn write_atomic(path: &str, data: &[u8]) -> Result<()> {
-    let tmp = format!("{}.tmp.{}", path, std::process::id());
-    std::fs::write(&tmp, data).with_context(|| format!("writing {}", tmp))?;
-    std::fs::rename(&tmp, path).with_context(|| format!("renaming into {}", path))?;
+    let mut rnd = [0u8; 12];
+    getrandom::getrandom(&mut rnd)
+        .map_err(|e| anyhow!("gathering randomness for temp name: {e}"))?;
+    let tmp = format!("{}.tmp.{}", path, hex::encode(rnd));
+
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let attempt = (|| -> Result<()> {
+        let mut f = opts
+            .open(&tmp)
+            .with_context(|| format!("creating temp file {}", tmp))?;
+        f.write_all(data)
+            .with_context(|| format!("writing {}", tmp))?;
+        f.sync_all()
+            .with_context(|| format!("flushing {} to disk", tmp))?;
+        Ok(())
+    })();
+    if let Err(e) = attempt {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp); // don't leave the container's plaintext-equivalent behind
+        return Err(e).with_context(|| format!("renaming into {}", path));
+    }
     Ok(())
 }
 
@@ -351,10 +408,16 @@ fn write_target(path: &str, data: &[u8], raw: bool) -> Result<()> {
     if !raw {
         return write_atomic(path, data);
     }
-    let mut f = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false)
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).write(true).truncate(false);
+    #[cfg(unix)]
+    {
+        // Owner-only if we end up creating a regular file; a no-op on an existing
+        // device node (whose permissions are managed in /dev). Don't rely on umask.
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts
         .open(path)
         .with_context(|| format!("opening {} for raw write", path))?;
     f.write_all(data)

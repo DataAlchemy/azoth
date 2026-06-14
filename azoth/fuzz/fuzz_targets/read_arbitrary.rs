@@ -19,8 +19,8 @@ fuzz_target!(|data: &[u8]| {
     // Derive K (odd, >= 3, bounded well under the bit-count) and a password from input.
     let k = 3 + (u64::from(data[0]) % 250) | 1;
     let block = data[1..].to_vec();
-    // FAST_TEST keeps each iteration cheap; the parsing logic is cost-independent.
-    if let Ok(c) = Kpdc::from_bytes(block, k, KdfParams::FAST_TEST) {
+    // INSECURE_FAST_TEST keeps each iteration cheap; the parsing logic is cost-independent.
+    if let Ok(c) = Kpdc::from_bytes(block, k, KdfParams::INSECURE_FAST_TEST) {
         let pw = format!("fuzz-{}", data[0]);
         let _ = c.read(&pw, 4);
         let _ = c.plane_of(&pw, 4);
