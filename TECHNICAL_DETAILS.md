@@ -40,7 +40,8 @@ that holds up to **K** independent encrypted payloads. The design targets four p
    indistinguishable from uniform random bytes — no header, no index, no count. An *empty*
    container and a *full* one are byte-for-byte statistically identical.
 4. **Multi-key.** Different passwords decrypt to completely different plaintexts; a wrong
-   credential yields nothing (noise).
+   credential decrypts nothing — the read simply fails (returns `None` / the CLI errors),
+   indistinguishable from probing an empty plane. It does *not* return noise or a decoy.
 
 The defining differentiator versus deployed tools (e.g. VeraCrypt's outer+hidden volume, which
 tops out at two) is property 3 + 4 combined at scale: **K independent payloads whose very count
