@@ -1,0 +1,41 @@
+name: Release
+
+# Build the Windows binaries and publish them to a GitHub Release whenever a version tag
+# (e.g. v0.1.0) is pushed. Uses MSVC on the windows runner + a static CRT, so the exes are
+# self-contained (no MinGW, no Visual C++ redistributable needed).
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write # create the Release and upload assets (uses the built-in GITHUB_TOKEN)
+
+jobs:
+  windows:
+    name: Windows binaries (MSVC, self-contained)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: rustc --version && cargo --version
+
+      # Built from the repo root, so the library's pinned core/rust-toolchain.toml does not
+      # apply and the runner's stable toolchain is used. azoth-gui -> azoth-gui.exe and
+      # azoth-cmd -> azoth.exe (distinct names, no output collision).
+      - name: Build release binaries
+        env:
+          RUSTFLAGS: "-C target-feature=+crt-static"
+        run: cargo build --release -p azoth-gui -p azoth-cmd
+
+      - name: Publish to GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            target/release/azoth-gui.exe \
+            target/release/azoth.exe \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes
