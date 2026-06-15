@@ -130,6 +130,10 @@ cost), and a status-log pane. It calls the shared `azoth` core — **no new cryp
 the CLI's warnings (non-prime `K`, custom KDF cost, re-randomize data-loss). Argon2id runs on a
 worker thread, so the window never freezes.
 
+**Download:** prebuilt, self-contained Windows binaries — `azoth-gui.exe` (GUI) and `azoth.exe`
+(CLI) — are attached to every [release](https://github.com/DataAlchemy/azoth/releases/latest)
+(built on CI; no runtime to install). Or build from source:
+
 **Build with Rust's GNU toolchain (no Visual Studio needed):**
 
 ```powershell
