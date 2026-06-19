@@ -13,6 +13,7 @@ Pinned primitives (this reference):
   XOF / PRF       : SHAKE256
   fast hash       : SHA-256
   MAC             : HMAC-SHA256
+  payload cipher  : aes256ctr (default) | chacha20 | shake256  (selectable, part of credential)
   intra-plane walk: SHAKE-driven distinct-slot sequence (counter mode + rejection sampling)
 
 THIS IS A READABLE REFERENCE, NOT PRODUCTION CODE.
@@ -20,6 +21,9 @@ THIS IS A READABLE REFERENCE, NOT PRODUCTION CODE.
   * scrypt N defaults to 2^16 (~64 MiB); raise for higher assurance.
   * Whole-block re-randomize is available via write_all_fresh() (defeats multi-snapshot
     diffing). v1 single-snapshot scope still applies to the plain in-place write().
+  * The payload cipher is selectable and is part of the credential (not stored, like K). It is
+    bound into the token + MAC so a wrong cipher fails cleanly. aes256ctr / chacha20 require
+    `pip install cryptography` (imported lazily); shake256 is pure stdlib.
 
 NOT WIRE-COMPATIBLE with the Rust crate (azoth/). The Rust implementation uses
 Argon2id (not scrypt) and a rejection-sampled XOF *stream* slot walk (vs this file's
@@ -111,10 +115,18 @@ def _bits_to_bytes(bits):
 class KPDC:
     """A K-plane deniable container backed by a mutable byte block."""
 
-    def __init__(self, block, K):
+    # Selectable payload ciphers — like K and the KDF cost, the cipher is part of the credential
+    # and is NOT stored; read and write must use the same value. (The default mirrors the Rust
+    # crate's default.) AES-CTR and ChaCha20 need `cryptography` (imported lazily); SHAKE256 is stdlib.
+    CIPHERS = ("aes256ctr", "chacha20", "shake256")
+
+    def __init__(self, block, K, cipher="aes256ctr"):
         self.block = bytearray(block)
         self.B = len(self.block)
         self.nbits = 8 * self.B
+        if cipher not in self.CIPHERS:
+            raise ValueError("unknown cipher %r: use one of %s" % (cipher, ", ".join(self.CIPHERS)))
+        self.cipher = cipher
         if K < 2 or K > self.nbits:
             raise ValueError(
                 "invalid K=%d: must satisfy 2 <= K <= block bit-count (%d)" % (K, self.nbits)
@@ -132,9 +144,9 @@ class KPDC:
         self.K = K
 
     @classmethod
-    def create(cls, B, K, rng=secrets.token_bytes):
+    def create(cls, B, K, rng=secrets.token_bytes, cipher="aes256ctr"):
         """Fresh container = B random bytes. Indistinguishable from any full one."""
-        return cls(bytearray(rng(B)), K)
+        return cls(bytearray(rng(B)), K, cipher)
 
     # ---- plane geometry: plane p owns global bit-indices g with g % K == p ----
     def _plane_slots(self, p):
@@ -192,6 +204,35 @@ class KPDC:
             maxmem=SCRYPT_MAXMEM, dklen=32,
         )
 
+    def _cipher_tag(self):
+        # Domain-separation tag bound into the token + MAC key so reading with the wrong cipher
+        # fails at the token gate (clean None), not with garbage. shake256 uses an EMPTY tag, so
+        # its wire format is byte-identical to the original single-cipher reference.
+        return {"aes256ctr": b"aes256ctr", "chacha20": b"chacha20", "shake256": b""}[self.cipher]
+
+    def _keystream(self, mk, n):
+        # ct = pt XOR keystream. All three are IND$ stream ciphers; the choice is invisible in the
+        # ciphertext. AES-CTR / ChaCha20 use the `cryptography` package (imported lazily so the
+        # shake256 mode — and the rest of this reference — stay stdlib-only). pip install cryptography.
+        if self.cipher == "shake256":
+            return shake(mk, b"stream", nbytes=n)
+        from cryptography.hazmat.backends import default_backend
+        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+        if self.cipher == "aes256ctr":
+            kn = shake(mk, b"stream-aes256ctr", nbytes=48)  # 32-byte key + 16-byte IV (BE counter)
+            algo, mode = algorithms.AES(kn[:32]), modes.CTR(kn[32:48])
+        elif self.cipher == "chacha20":
+            # NOTE: `cryptography`'s ChaCha20 is the 16-byte-nonce / 64-bit-counter (Bernstein)
+            # variant — NOT the Rust crate's IETF ChaCha20 (12-byte nonce). Self-consistent for this
+            # reference's own round-trip; it does not reproduce the Rust keystream (this file is not
+            # wire-compatible with the Rust crate regardless — different KDF + walk).
+            kn = shake(mk, b"stream-chacha20", nbytes=48)  # 32-byte key + 16-byte nonce
+            algo, mode = algorithms.ChaCha20(kn[:32], kn[32:48]), None
+        else:
+            raise ValueError("unknown cipher %r" % self.cipher)
+        enc = Cipher(algo, mode, backend=default_backend()).encryptor()
+        return enc.update(b"\x00" * n) + enc.finalize()
+
     # ---- read side ----
     def _locate(self, pw, maxprobe):
         """Return (plane, plaintext) for pw, or None. Sweeps from home, open-addressed."""
@@ -208,7 +249,7 @@ class KPDC:
 
             salt = _xor(_bits_to_bytes(head[0:S_BITS]), smask)
             mk = self._slow(pw, salt)
-            token = shake(mk, b"token", nbytes=T_BITS // 8)
+            token = shake(mk, b"token", self._cipher_tag(), nbytes=T_BITS // 8)
             stored_token = _bits_to_bytes(head[S_BITS:S_BITS + T_BITS])
             if not hmac.compare_digest(token, stored_token):
                 continue  # fast reject: wrong plane / wrong credential
@@ -228,10 +269,10 @@ class KPDC:
             ct = _bits_to_bytes(ct_bits)
             tag = _bits_to_bytes(tag_bits)
 
-            mackey = shake(mk, b"mac", nbytes=32)
+            mackey = shake(mk, b"mac", self._cipher_tag(), nbytes=32)
             if not hmac.compare_digest(tag, hmac.new(mackey, ct, hashlib.sha256).digest()):
                 continue  # tampered or rare false token-match
-            stream = shake(mk, b"stream", nbytes=L)
+            stream = self._keystream(mk, L)
             return plane, _xor(ct, stream)
         return None
 
@@ -289,10 +330,10 @@ class KPDC:
             salt = secrets.token_bytes(S_BITS // 8)
         smask = self._smask(prk)
         mk = self._slow(pw, salt)
-        token = shake(mk, b"token", nbytes=T_BITS // 8)
+        token = shake(mk, b"token", self._cipher_tag(), nbytes=T_BITS // 8)
         lenmask = shake(mk, b"len", nbytes=LEN_BITS // 8)
-        stream = shake(mk, b"stream", nbytes=len(plaintext))
-        mackey = shake(mk, b"mac", nbytes=32)
+        stream = self._keystream(mk, len(plaintext))
+        mackey = shake(mk, b"mac", self._cipher_tag(), nbytes=32)
 
         ct = _xor(plaintext, stream)
         tag = hmac.new(mackey, ct, hashlib.sha256).digest()
@@ -314,7 +355,7 @@ class KPDC:
 
         `payloads` is an iterable of (password, plaintext) pairs."""
         payloads = list(payloads)
-        tmp = KPDC(bytearray(rng(self.B)), self.K)
+        tmp = KPDC(bytearray(rng(self.B)), self.K, self.cipher)
         for i, (pw, pt) in enumerate(payloads):
             known = [p for (p, _) in payloads[:i]]
             tmp.write(pw, pt, known, maxprobe, None)
@@ -330,27 +371,32 @@ if __name__ == "__main__":
 
     K = next_prime_coprime8(419)
     print("K =", K, "(prime, coprime to 8)")
-
-    c = KPDC.create(65536, K, rng=det_rng)
-
     pw_a, msg_a = "correct horse battery staple", b"the treaty is signed at dawn"
     pw_b, msg_b = "hunter2-xK!", b"meet at pier 39, midnight"
 
-    # Whole-block re-randomize write (defeats multi-snapshot diffing): rebuild from
-    # ALL payloads. Anything omitted would be destroyed.
-    c.write_all_fresh([(pw_a, msg_a), (pw_b, msg_b)], maxprobe=4, rng=det_rng)
-    print("re-randomized container with 2 payloads under 2 passwords")
+    # Exercise every selectable cipher. The cipher — like K and the KDF cost — is part of the
+    # credential and is never stored. aes256ctr / chacha20 need `cryptography`; shake256 is stdlib.
+    for cipher in KPDC.CIPHERS:
+        try:
+            c = KPDC.create(65536, K, rng=det_rng, cipher=cipher)
+            # Whole-block re-randomize write (defeats multi-snapshot diffing): rebuild from ALL
+            # payloads. Anything omitted would be destroyed.
+            c.write_all_fresh([(pw_a, msg_a), (pw_b, msg_b)], maxprobe=4, rng=det_rng)
+            assert c.read(pw_a, maxprobe=4) == msg_a, "A round-trip failed"
+            assert c.read(pw_b, maxprobe=4) == msg_b, "B round-trip failed"
+            assert c.read("wrong password", maxprobe=4) is None, "wrong pw should yield None"
+            mean = sum(c.block) / len(c.block)
+            print(
+                "[%-10s] 2 payloads round-trip OK; wrong pw -> None; "
+                "byte mean %.2f (uniform ~127.5); block[:16]=%s"
+                % (cipher, mean, c.block[:16].hex())
+            )
+        except ImportError:
+            print("[%-10s] skipped (needs cryptography: pip install cryptography)" % cipher)
 
-    assert c.read(pw_a, maxprobe=4) == msg_a, "A round-trip failed"
-    assert c.read(pw_b, maxprobe=4) == msg_b, "B round-trip failed"
-    assert c.read("wrong password", maxprobe=4) is None, "wrong password should yield None"
-    print("round-trip OK; wrong password -> None")
-
-    # holder of pw_a learns plane A only; cannot see B or the count
-    print("pw_a sees plane:", c.plane_of(pw_a, 4), "| pw_b sees plane:", c.plane_of(pw_b, 4))
-    print("(tip: store genuine-but-innocuous decoy secrets too, as plausible cover)")
-
-    # indistinguishability sniff: byte mean should sit near 127.5 (uniform)
-    mean = sum(c.block) / len(c.block)
-    print("block byte mean: %.2f (uniform ~127.5)" % mean)
-    print("reproducible vector block[:32] =", c.block[:32].hex())
+    print(
+        "(note: the cipher, like K and the KDF cost, is part of the credential and is not stored. "
+        "azoth hides the contents/count of the block IN ISOLATION — not that you use it, and not "
+        "under coercion: a tool built to hide payloads invites 'now the others'. Not an "
+        "interrogation defense; see README / TECHNICAL_DETAILS.)"
+    )

@@ -6,7 +6,7 @@
 //! functional multi-key/re-randomize tests run at `KdfParams::RECOMMENDED` (the real
 //! default) with small K/maxprobe to keep the Argon2 call count low.
 
-use azoth::{next_prime_coprime8, KdfParams, Kpdc};
+use azoth::{next_prime_coprime8, Cipher, KdfParams, Kpdc};
 use sha3::digest::{ExtendableOutput, Update, XofReader};
 use sha3::Shake256;
 
@@ -300,27 +300,52 @@ const KAT_SALT: [u8; 16] = [0x42; 16];
 const KAT_PW: &str = "known-answer";
 const KAT_PT: &[u8] = b"known answer payload";
 const KAT_BLOCK_LEN: usize = 8192;
-// Pinned under KdfParams::RECOMMENDED. Update ONLY if the wire format intentionally changes.
-const KAT_FNV: u64 = 0xeabe2c5067fdcf54;
+// Pinned wire-format vectors (FNV-1a of the block) under KdfParams::RECOMMENDED, one per cipher.
+// The SHAKE256 value is UNCHANGED from azoth's original single-cipher format (its cipher tag is
+// empty, so the token/MAC/keystream derivation is byte-identical) — proving the cipher work did
+// not perturb that path. Update a value ONLY on an intentional wire-format change for that cipher.
+const KAT_FNV_AES256CTR: u64 = 0xd61dda5b3299391e;
+const KAT_FNV_CHACHA20: u64 = 0xa3b6600350515b5e;
+const KAT_FNV_SHAKE256: u64 = 0xeabe2c5067fdcf54;
 
-#[test]
-fn known_answer_write_and_read() {
+fn kat_one(cipher: Cipher, expect_fnv: u64) {
     // Start from an all-zero block so the output is fully determined by the inputs.
-    let mut c = Kpdc::from_bytes(vec![0u8; KAT_BLOCK_LEN], KAT_K, REC).unwrap();
+    let mut c = Kpdc::from_bytes_with(vec![0u8; KAT_BLOCK_LEN], KAT_K, REC, cipher).unwrap();
     let plane = c
         .write(KAT_PW, KAT_PT, &[], KAT_MP, Some(&KAT_SALT))
         .unwrap();
     let got = fnv1a(c.as_bytes());
-    assert_eq!(
-        got, KAT_FNV,
-        "KAT MISMATCH: wire format changed (plane={plane}, fnv=0x{got:016x}). \
-         If intentional, update KAT_FNV."
-    );
-    // And it reads back.
+    eprintln!("KAT {cipher:?}: plane={plane} fnv=0x{got:016x}");
+    if expect_fnv != 0 {
+        assert_eq!(
+            got, expect_fnv,
+            "KAT MISMATCH for {cipher:?}: wire format changed (fnv=0x{got:016x}). \
+             If intentional, update the pinned value."
+        );
+    }
+    // And it reads back under that cipher.
     assert_eq!(
         c.read(KAT_PW, KAT_MP).map(|z| z.to_vec()),
         Some(KAT_PT.to_vec())
     );
+}
+
+#[test]
+fn known_answer_write_and_read() {
+    kat_one(Cipher::Aes256Ctr, KAT_FNV_AES256CTR);
+    kat_one(Cipher::ChaCha20, KAT_FNV_CHACHA20);
+    kat_one(Cipher::Shake256, KAT_FNV_SHAKE256);
+    // The three ciphers must produce DIFFERENT containers from identical (pw, K, KDF, salt,
+    // plaintext) — proof the cipher genuinely changes the keystream and the cipher-bound token/MAC.
+    let fnvs = [KAT_FNV_AES256CTR, KAT_FNV_CHACHA20, KAT_FNV_SHAKE256];
+    for i in 0..fnvs.len() {
+        for j in (i + 1)..fnvs.len() {
+            assert_ne!(
+                fnvs[i], fnvs[j],
+                "two ciphers produced identical KAT blocks"
+            );
+        }
+    }
 }
 
 // =========================================================================== //
@@ -333,42 +358,54 @@ fn known_answer_write_and_read() {
 
 #[test]
 fn heavily_filled_container_stays_uniform() {
-    // Pack ~one large payload per plane (close to capacity), then check the block
-    // is still uniform in byte value, bit density, and runs. Here PRF output is the
-    // majority of the bits, so this stresses "do our modifications stay on-norm".
-    let k = next_prime_coprime8(17);
-    let mp = k as usize;
-    let mut c = Kpdc::from_bytes(shake_fill(65_536, b"heavy-fill"), k, FAST).unwrap();
-    let mut known: Vec<String> = Vec::new();
-    let mut placed = 0usize;
-    while placed < k as usize {
-        let pw = format!("p{placed}");
-        let kr: Vec<&str> = known.iter().map(|s| s.as_str()).collect();
-        match c.write(&pw, &vec![0xABu8; 3500], &kr, mp, None) {
-            Ok(_) => {
-                known.push(pw);
-                placed += 1;
+    // Pack ~one large payload per plane (close to capacity), then check the block is still uniform
+    // in byte value, bit density, and runs. Here the keystream is the MAJORITY of the bits, so this
+    // is the test with real statistical power over the cipher — run it for EVERY cipher so the
+    // AES-CTR, ChaCha20, and SHAKE256 keystreams are each exercised against the battery (not just
+    // the default). A cipher-specific structural artifact would surface here.
+    for cipher in [Cipher::Aes256Ctr, Cipher::ChaCha20, Cipher::Shake256] {
+        let k = next_prime_coprime8(17);
+        let mp = k as usize;
+        let seed = format!("heavy-fill-{cipher:?}");
+        let mut c =
+            Kpdc::from_bytes_with(shake_fill(65_536, seed.as_bytes()), k, FAST, cipher).unwrap();
+        let mut known: Vec<String> = Vec::new();
+        let mut placed = 0usize;
+        while placed < k as usize {
+            let pw = format!("p{placed}");
+            let kr: Vec<&str> = known.iter().map(|s| s.as_str()).collect();
+            match c.write(&pw, &vec![0xABu8; 3500], &kr, mp, None) {
+                Ok(_) => {
+                    known.push(pw);
+                    placed += 1;
+                }
+                Err(_) => break,
             }
-            Err(_) => break,
         }
-    }
-    assert!(
-        placed >= 12,
-        "expected to pack many payloads, only placed {placed}"
-    );
+        assert!(
+            placed >= 12,
+            "{cipher:?}: expected to pack many payloads, only placed {placed}"
+        );
 
-    let block = c.as_bytes();
-    let nbits = (block.len() * 8) as f64;
-    let chi = chi_square_bytes(block);
-    let ones = ones_fraction(block);
-    let t = bit_transitions(block) as f64;
-    assert!(chi > 120.0 && chi < 420.0, "heavy-fill byte chi {chi}");
-    assert!((ones - 0.5).abs() < 0.01, "heavy-fill bit density {ones}");
-    let exp_t = (nbits - 1.0) / 2.0;
-    assert!(
-        (t - exp_t).abs() < 3.0 * nbits.sqrt(),
-        "heavy-fill runs {t} vs expected {exp_t}"
-    );
+        let block = c.as_bytes();
+        let nbits = (block.len() * 8) as f64;
+        let chi = chi_square_bytes(block);
+        let ones = ones_fraction(block);
+        let t = bit_transitions(block) as f64;
+        assert!(
+            chi > 120.0 && chi < 420.0,
+            "{cipher:?}: heavy-fill byte chi {chi}"
+        );
+        assert!(
+            (ones - 0.5).abs() < 0.01,
+            "{cipher:?}: heavy-fill bit density {ones}"
+        );
+        let exp_t = (nbits - 1.0) / 2.0;
+        assert!(
+            (t - exp_t).abs() < 3.0 * nbits.sqrt(),
+            "{cipher:?}: heavy-fill runs {t} vs expected {exp_t}"
+        );
+    }
 }
 
 #[test]

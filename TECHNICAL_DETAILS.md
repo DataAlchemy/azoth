@@ -51,9 +51,11 @@ is unprovable** — an adversary cannot show "there is a 3rd / 4th payload," eve
 
 ## 2. Threat model and scope
 
-**Credential.** Unlocking requires `(password, K, KDF-cost)`. None of these is stored in the
-block. `K` and the Argon2id cost are per-container parameters you must remember/transmit
-out-of-band, exactly like the password.
+**Credential.** Unlocking requires `(password, K, KDF-cost, cipher)`. None of these is stored in
+the block. `K`, the Argon2id cost, and the payload cipher (AES-256-CTR default · ChaCha20 ·
+SHAKE256-keystream) are per-container parameters you must remember/transmit out-of-band, exactly
+like the password. The cipher is bound into the recognition token + MAC key, so a wrong cipher
+fails cleanly (no payload found) like a wrong password — it never yields garbage plaintext.
 
 ### Defended
 
@@ -77,10 +79,20 @@ out-of-band, exactly like the password.
   SHAKE256/HMAC/Argon2id outputs being indistinguishable from random. A break of those breaks
   the claim.
 - **Existence of the container as a high-entropy blob.** azoth hides *what* and *how much*, not
-  *that a random-looking file exists*. A 64 MiB file of pure entropy can itself invite suspicion;
-  the operational answer is a plausible cover (disk free/slack space, a "wiped" partition) and/or
-  a **genuine but innocuous decoy payload** you can reveal under pressure. The CLI encourages this
-  on `create`.
+  *that a random-looking file exists*. A file of pure entropy can itself invite suspicion; the
+  only answer is a plausible cover for randomness (disk free/slack space, a "wiped" partition).
+- **Operational / coercion deniability — NOT provided.** This is the important one. Indistinguish-
+  ability is a property of the *block in isolation*; it says nothing about the rest of your system.
+  The `azoth` binary, package records, shell history (`azoth read --file …`), and your demonstrable
+  use of deniable-encryption software are all trails that the bytes' uniformity does nothing to
+  hide. Above all, it does **not** survive **coercion**: if you are compelled to decrypt, running a
+  tool built to hold hidden payloads tells the adversary more may exist, and coercion runs on
+  *suspicion, not proof* — they need not accept that you revealed everything. A "genuine but
+  innocuous decoy you reveal under pressure" is **not** a defense and we no longer recommend it: the
+  construction is public, so an adversary who knows it simply keeps coercing. The property is
+  meaningful only when the blob is found *without you and without the tool* (abandoned/wiped media,
+  slack space, bytes mixed into other randomness) by an inspector who cannot tie it to azoth.
+  Beating an interrogation is not a problem cryptography can solve, and azoth does not pretend to.
 - **Read-side timing channels** (e.g. probe-count timing). Not hardened in v1.
 
 ---
@@ -177,17 +189,24 @@ walk(p) = distinct slot indices in [0, plane_slots(p)),     # SlotWalk:
 
 # Slow, salt-DEPENDENT (the memory-hard gate):
 mk      = Argon2id( pw_utf8 ‖ K_be64, salt )               # 32 bytes, zeroized
-token   = SHAKE256( mk ‖ "token" )                          # 16 bytes
+ctag    = "aes256ctr" | "chacha20" | "" (shake256)         # cipher domain-separation tag
+token   = SHAKE256( mk ‖ "token" ‖ ctag )                   # 16 bytes
 lenmask = SHAKE256( mk ‖ "len" )                            # 4 bytes
-stream  = SHAKE256( mk ‖ "stream" ) truncated to len bytes  # keystream
-mackey  = SHAKE256( mk ‖ "mac" )                            # 32 bytes
+mackey  = SHAKE256( mk ‖ "mac" ‖ ctag )                     # 32 bytes
 tag     = HMAC-SHA256( mackey, ciphertext )
+# Keystream — selected by the cipher credential (all IND$; key/nonce SHAKE-derived from mk):
+stream  = AES-256-CTR( k=H(mk‖"stream-aes256ctr")[:32], iv=…[32:48] )   # default
+        | ChaCha20(    k=H(mk‖"stream-chacha20")[:32],   nonce=…[32:44] )
+        | SHAKE256( mk ‖ "stream" )                                       # original
+        truncated to len bytes
 ```
 
 The `home`/`smask`/`walk` derivations use only `prk` (i.e. `pw` and `K`), so the reader can
 bootstrap. The memory-hard `mk` and everything below it depend on the salt, so they cannot be
 computed until the salt has been read — and computing them is the expensive, brute-force-gating
-step.
+step. The cipher is bound into `token` and `mackey` via `ctag`; SHAKE256 uses the **empty** tag,
+so its wire format is byte-identical to the original single-cipher design (its KAT is unchanged),
+while a mismatched cipher fails at the constant-time token compare — a clean miss, not garbage.
 
 ### 4.4 On-walk layout of one payload
 
@@ -269,7 +288,7 @@ omitted is destroyed), so the CLI gates it behind `--all-keys`.
 
 ### 4.9 CLI surface
 
-- `create --size --k --out` — fill a random block; prints decoy-storage guidance.
+- `create --size --k --out` — fill a random block; prints a deniability-scope reminder.
 - `write --file --k [--password] --data [--known …] [--all-keys] [--no-rerandomize] [--kdf-mem-mib --kdf-iters]`
   — default re-randomizes the whole block (requires `--all-keys`); `--no-rerandomize` does a
   faster in-place write that is **not** multi-snapshot-safe. Custom KDF cost warns "remember it."
@@ -288,7 +307,8 @@ Container writes are **atomic** (temp file + rename), so a crash cannot corrupt 
 | Role | Primitive | Why |
 |---|---|---|
 | Memory-hard KDF | **Argon2id**, default 256 MiB / 3 passes / 1 lane | Side-channel-resistant memory-hardness; the cost is the brute-force gate. Cost is part of the credential, not stored. |
-| XOF / PRF / keystream | **SHAKE256** | A XOF needs no HKDF extract/expand; `SHAKE256(key ‖ label)` is a clean keyed PRF with domain separation by label, with no SHA-2 length-extension concern. |
+| XOF / PRF / subkeys | **SHAKE256** | A XOF needs no HKDF extract/expand; `SHAKE256(key ‖ label)` is a clean keyed PRF with domain separation by label, with no SHA-2 length-extension concern. Used for token/len/mac subkeys, masks, the walk, and (in SHAKE256 mode) the keystream. |
+| Payload cipher | **AES-256-CTR** (default) · **ChaCha20** · **SHAKE256-keystream** | Selectable, part of the credential (not stored). All three are IND$ — the ciphertext is indistinguishable from random and from each other — so the choice leaks nothing. Key/nonce are SHAKE-derived from `mk` under a cipher-specific label; the cipher is bound into `token`+`mackey` so a wrong choice fails cleanly. AES-CTR & ChaCha20 via RustCrypto `aes`/`ctr`/`chacha20`. **Migration:** containers from the pre-cipher build use SHAKE256 (byte-identical original format) — read with `--cipher shake256`. |
 | Fast hash (positions) | **SHA-256** | `prk` only derives positions (cheap, salt-independent); the slow gate is Argon2id, so a fast hash here doesn't weaken brute-force resistance. |
 | Integrity | **HMAC-SHA256** | Encrypt-then-MAC; tamper-evident; tag is indistinguishable from random. |
 | CSPRNG | OS (`getrandom`) / Python `secrets` | Block fill and per-write salts. |
@@ -376,8 +396,12 @@ the fill's changes.
    up to `min(maxprobe, K)` Argon2id evaluations (a feature for guessing-cost, a UX cost).
 5. **Deniable destruction.** A coercer can randomize the block to destroy data without reading it;
    the HMAC detects but cannot prevent this.
-6. **Cover-story problem.** A high-entropy blob can itself be incriminating; azoth provides
-   content-deniability, not existence-of-the-blob deniability. Pair with a cover + decoy payload.
+6. **Cover-story & tool-trace problem.** A high-entropy blob can itself be incriminating, and the
+   *tool* leaves traces (binary, package records, shell history) that no decoy payload hides. azoth
+   provides content-deniability of the block **in isolation** — not existence-of-the-blob
+   deniability, and **not** deniability under coercion. Revealing a decoy does nothing against an
+   adversary who knows you use a hidden-payload tool; see §2 ("Operational / coercion deniability —
+   NOT provided"). Do not rely on azoth to survive a "decrypt-or-else" demand.
 7. **Read-side timing** is not constant-probe in v1.
 8. **Unaudited.** No independent professional cryptographic review has been done.
 

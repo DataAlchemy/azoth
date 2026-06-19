@@ -29,6 +29,8 @@
 pub mod app;
 
 use argon2::{Algorithm, Argon2, Params, Version};
+use chacha20::ChaCha20;
+use ctr::cipher::{KeyIvInit, StreamCipher};
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 use sha3::digest::{ExtendableOutput, Update, XofReader};
@@ -36,6 +38,9 @@ use sha3::Shake256;
 use std::collections::HashSet;
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
+
+/// AES-256 in CTR mode with a full 16-byte big-endian counter (the IV is the initial counter).
+type Aes256Ctr = ctr::Ctr128BE<aes::Aes256>;
 
 // ---- field sizes (bits) ----
 const S_BITS: usize = 128; // per-write salt (nonce)
@@ -80,6 +85,26 @@ impl Default for KdfParams {
     fn default() -> Self {
         KdfParams::RECOMMENDED
     }
+}
+
+/// Payload encryption algorithm — the keystream in `ct = pt ⊕ keystream` is produced by this.
+///
+/// **Part of the credential**, like `K` and the KDF cost: it is NOT stored in the block (storing
+/// it would be detectable structure), so read and write must use the same value. All three produce
+/// a keystream computationally indistinguishable from random, so the choice is invisible in the
+/// ciphertext. The cipher is bound into the recognition token + MAC key, so reading with the wrong
+/// cipher fails cleanly (`None`) exactly like a wrong password — it never returns garbage.
+///
+/// A container carries one cipher (like one `K`); mixing ciphers within a block is unsupported.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Cipher {
+    /// AES-256 in CTR mode (the default). Key + 128-bit big-endian counter derived from `mk`.
+    #[default]
+    Aes256Ctr,
+    /// IETF ChaCha20 (96-bit nonce, 32-bit counter). Key + nonce derived from `mk`.
+    ChaCha20,
+    /// SHAKE256 squeezed directly as a keystream (azoth's original cipher; fewest primitives).
+    Shake256,
 }
 
 #[derive(Debug)]
@@ -295,11 +320,23 @@ pub struct Kpdc {
     block: Vec<u8>,
     k: u64,
     kdf: KdfParams,
+    cipher: Cipher,
 }
 
 impl Kpdc {
-    /// Wrap an existing block (e.g. read from disk) with its credential params.
+    /// Wrap an existing block (e.g. read from disk) with its credential params, using the default
+    /// payload cipher ([`Cipher::Aes256Ctr`]). Use [`Kpdc::from_bytes_with`] to select another.
     pub fn from_bytes(block: Vec<u8>, k: u64, kdf: KdfParams) -> Result<Self, Error> {
+        Self::from_bytes_with(block, k, kdf, Cipher::default())
+    }
+
+    /// Wrap an existing block with its credential params and an explicit payload [`Cipher`].
+    pub fn from_bytes_with(
+        block: Vec<u8>,
+        k: u64,
+        kdf: KdfParams,
+        cipher: Cipher,
+    ) -> Result<Self, Error> {
         let nbits = (block.len() as u64) * 8;
         if k < 2 || k > nbits {
             return Err(Error::InvalidK { k, nbits });
@@ -313,23 +350,41 @@ impl Kpdc {
             return Err(Error::NonCoprimeK { k });
         }
         validate_kdf(kdf)?;
-        Ok(Kpdc { block, k, kdf })
+        Ok(Kpdc {
+            block,
+            k,
+            kdf,
+            cipher,
+        })
     }
 
-    /// Create a fresh container = `size` random bytes (indistinguishable from any full one).
+    /// Create a fresh container = `size` random bytes (indistinguishable from any full one),
+    /// using the default payload cipher ([`Cipher::Aes256Ctr`]). The cipher only matters at
+    /// write/read time — a fresh block is pure noise regardless of it. Use [`Kpdc::create_with`]
+    /// to select another.
     pub fn create(size: usize, k: u64, kdf: KdfParams) -> Result<Self, Error> {
+        Self::create_with(size, k, kdf, Cipher::default())
+    }
+
+    /// Create a fresh container with an explicit payload [`Cipher`].
+    pub fn create_with(size: usize, k: u64, kdf: KdfParams, cipher: Cipher) -> Result<Self, Error> {
         let nbits = (size as u64) * 8;
         if k < 2 || k > nbits {
             return Err(Error::InvalidK { k, nbits });
         }
-        // Coprime-to-8 (odd) is mandatory for indistinguishability — see `from_bytes`.
+        // Coprime-to-8 (odd) is mandatory for indistinguishability — see `from_bytes_with`.
         if k.is_multiple_of(2) {
             return Err(Error::NonCoprimeK { k });
         }
         validate_kdf(kdf)?;
         let mut block = vec![0u8; size];
         getrandom::getrandom(&mut block).map_err(|_| Error::Rng)?;
-        Ok(Kpdc { block, k, kdf })
+        Ok(Kpdc {
+            block,
+            k,
+            kdf,
+            cipher,
+        })
     }
 
     pub fn as_bytes(&self) -> &[u8] {
@@ -340,6 +395,10 @@ impl Kpdc {
     }
     pub fn k(&self) -> u64 {
         self.k
+    }
+    /// The payload cipher this container reads and writes with.
+    pub fn cipher(&self) -> Cipher {
+        self.cipher
     }
 
     fn nbits(&self) -> u64 {
@@ -393,6 +452,46 @@ impl Kpdc {
         shake(&[prk, b"saltmask"], S_BITS / 8)
     }
 
+    /// Domain-separation tag that binds the cipher into the token + MAC key, so reading with the
+    /// wrong cipher fails at the token gate (clean `None`) instead of returning garbage. SHAKE256
+    /// uses an EMPTY tag, so absorbing it changes nothing: that mode's wire format stays
+    /// byte-identical to azoth's original single-cipher format (the SHAKE KAT and any pre-cipher
+    /// container still verify).
+    fn cipher_tag(&self) -> &'static [u8] {
+        match self.cipher {
+            Cipher::Aes256Ctr => b"aes256ctr",
+            Cipher::ChaCha20 => b"chacha20",
+            Cipher::Shake256 => b"",
+        }
+    }
+
+    /// Produce `len` bytes of keystream from `mk` for the selected cipher. The key/nonce are
+    /// SHAKE-derived under a cipher-specific label; the result is zeroized on drop. All three are
+    /// IND$ stream ciphers, so the keystream (and thus `ct = pt ⊕ keystream`) looks uniform.
+    fn keystream(&self, mk: &[u8; 32], len: usize) -> Zeroizing<Vec<u8>> {
+        match self.cipher {
+            Cipher::Shake256 => Zeroizing::new(shake(&[mk, b"stream"], len)),
+            Cipher::Aes256Ctr => {
+                // 32-byte key + 16-byte IV (the full 128-bit big-endian initial counter).
+                let kn = Zeroizing::new(shake(&[mk, b"stream-aes256ctr"], 48));
+                let mut ks = Zeroizing::new(vec![0u8; len]);
+                let mut c = Aes256Ctr::new_from_slices(&kn[..32], &kn[32..48])
+                    .expect("aes-256-ctr: 32-byte key + 16-byte IV");
+                c.apply_keystream(&mut ks);
+                ks
+            }
+            Cipher::ChaCha20 => {
+                // 32-byte key + 12-byte IETF nonce; the 32-bit block counter starts at 0.
+                let kn = Zeroizing::new(shake(&[mk, b"stream-chacha20"], 44));
+                let mut ks = Zeroizing::new(vec![0u8; len]);
+                let mut c = ChaCha20::new_from_slices(&kn[..32], &kn[32..44])
+                    .expect("chacha20: 32-byte key + 12-byte nonce");
+                c.apply_keystream(&mut ks);
+                ks
+            }
+        }
+    }
+
     // ---- read side ----
     fn locate(&self, pw: &str, maxprobe: usize) -> Option<(u64, Zeroizing<Vec<u8>>)> {
         let prk = self.prk(pw);
@@ -413,10 +512,10 @@ impl Kpdc {
             let salt = xor(&bits_to_bytes(&head[0..S_BITS]), &smask);
             let mk = argon2_kdf(pw.as_bytes(), self.k, &salt, self.kdf);
 
-            let token = shake(&[&*mk, b"token"], T_BITS / 8);
+            let token = shake(&[&*mk, b"token", self.cipher_tag()], T_BITS / 8);
             let stored_token = bits_to_bytes(&head[S_BITS..S_BITS + T_BITS]);
             if !ct_eq(&token, &stored_token) {
-                continue; // fast reject (constant-time)
+                continue; // fast reject (constant-time); also rejects a wrong cipher
             }
 
             let lenmask = shake(&[&*mk, b"len"], LEN_BITS / 8);
@@ -440,11 +539,11 @@ impl Kpdc {
             let ct = bits_to_bytes(&ct_bits);
             let tag = bits_to_bytes(&tag_bits);
 
-            let mackey = Zeroizing::new(shake(&[&*mk, b"mac"], 32));
+            let mackey = Zeroizing::new(shake(&[&*mk, b"mac", self.cipher_tag()], 32));
             if !ct_eq(&hmac_sha256(&mackey, &ct), &tag) {
                 continue; // tampered or rare false token match
             }
-            let stream = Zeroizing::new(shake(&[&*mk, b"stream"], l));
+            let stream = self.keystream(&mk, l);
             return Some((plane, Zeroizing::new(xor(&ct, &stream))));
         }
         None
@@ -532,10 +631,10 @@ impl Kpdc {
 
         let smask = self.smask(&prk);
         let mk = argon2_kdf(pw.as_bytes(), self.k, &salt, self.kdf);
-        let token = shake(&[&*mk, b"token"], T_BITS / 8);
+        let token = shake(&[&*mk, b"token", self.cipher_tag()], T_BITS / 8);
         let lenmask = shake(&[&*mk, b"len"], LEN_BITS / 8);
-        let stream = Zeroizing::new(shake(&[&*mk, b"stream"], plaintext.len()));
-        let mackey = Zeroizing::new(shake(&[&*mk, b"mac"], 32));
+        let stream = self.keystream(&mk, plaintext.len());
+        let mackey = Zeroizing::new(shake(&[&*mk, b"mac", self.cipher_tag()], 32));
 
         let ct = xor(plaintext, &stream);
         let tag = hmac_sha256(&mackey, &ct);
@@ -577,6 +676,7 @@ impl Kpdc {
             block: fresh,
             k: self.k,
             kdf: self.kdf,
+            cipher: self.cipher,
         };
         for i in 0..payloads.len() {
             let (pw, pt) = payloads[i];
@@ -709,6 +809,49 @@ mod tests {
             Err(Error::BadSaltLen { .. })
         ));
         assert!(c.write("pw", b"hi", &[], MP, Some(&[0u8; 16])).is_ok());
+    }
+
+    #[test]
+    fn all_ciphers_roundtrip() {
+        for cipher in [Cipher::Aes256Ctr, Cipher::ChaCha20, Cipher::Shake256] {
+            let mut c = Kpdc::create_with(SZ, K, REC, cipher).unwrap();
+            c.write("pw", b"hello, cipher world", &[], MP, None)
+                .unwrap();
+            assert_eq!(
+                c.read("pw", MP).map(|z| z.to_vec()),
+                Some(b"hello, cipher world".to_vec()),
+                "roundtrip failed for {cipher:?}"
+            );
+            assert!(
+                c.read("nope", MP).is_none(),
+                "false positive for {cipher:?}"
+            );
+            // empty payload must round-trip under every cipher too
+            let mut e = Kpdc::create_with(SZ, K, REC, cipher).unwrap();
+            e.write("e", b"", &[], MP, None).unwrap();
+            assert_eq!(e.read("e", MP).map(|z| z.to_vec()), Some(Vec::new()));
+        }
+    }
+
+    #[test]
+    fn wrong_cipher_fails_like_wrong_password() {
+        // Same (pw, K, KDF) but a different cipher must NOT decrypt — the cipher is bound into the
+        // token + MAC key, so a mismatch fails cleanly (None) and never returns garbage plaintext.
+        let mut c = Kpdc::create_with(SZ, K, REC, Cipher::Aes256Ctr).unwrap();
+        c.write("pw", b"top secret", &[], MP, None).unwrap();
+        let bytes = c.into_bytes();
+        for wrong in [Cipher::ChaCha20, Cipher::Shake256] {
+            let cw = Kpdc::from_bytes_with(bytes.clone(), K, REC, wrong).unwrap();
+            assert!(
+                cw.read("pw", MP).is_none(),
+                "wrong cipher {wrong:?} must not decrypt"
+            );
+        }
+        let right = Kpdc::from_bytes_with(bytes, K, REC, Cipher::Aes256Ctr).unwrap();
+        assert_eq!(
+            right.read("pw", MP).map(|z| z.to_vec()),
+            Some(b"top secret".to_vec())
+        );
     }
 
     #[test]

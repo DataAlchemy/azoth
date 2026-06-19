@@ -43,7 +43,7 @@ different passwords decrypt two completely different plaintexts from the very sa
 |---|---|
 | 🜂 **Indistinguishable** | An empty block and a full one are byte-for-byte statistically identical. There is nothing to find. |
 | 🜄 **Many-in-one** | Up to `K` payloads share one block, each on its own disjoint "plane." Set `K` as high as you want. |
-| 🜁 **Plausibly deniable** | Reveal one password under pressure; against an inspector without the others, their existence stays computationally deniable. |
+| 🜁 **Deniable in isolation** | Found *without you and without this tool*, the block reveals nothing about whether — or how many — payloads it holds. This does **not** cover the tool's traces or being compelled to run it; see [What azoth does NOT hide](#what-azoth-does-not-hide-read-this-first). |
 | 🜃 **No verifier an outsider can use** | No header, no fixed marker. The token that recognizes a correct password is random-looking and sits at a *credential-derived, scattered* position — without a candidate `(password, K, cost)` you can't find it, test it, or even tell data exists. Supply a candidate and it *does* confirm a correct guess: an offline oracle gated by the memory-hard KDF (use a strong password), not honey-encryption. |
 
 ## ✦ The trick, in one breath
@@ -96,8 +96,12 @@ c.read("mallory", 64); // None  (just noise)
 
 > **Operational notes.** Omit `--password` and azoth prompts without echo — preferred,
 > since CLI args leak via `ps`/history. The **KDF cost** (`--kdf-mem-mib`/`--kdf-iters`,
-> default Argon2id **256 MiB / 3 passes**) is part of the credential and is **not stored**:
-> if you change it you must remember the exact values to decrypt, or the data is lost.
+> default Argon2id **256 MiB / 3 passes**) and the **payload cipher** (`--cipher`, default
+> `aes-ctr`; also `chacha20` / `shake256`) are part of the credential and are **not stored**:
+> change either and you must supply the exact same values to decrypt, or the data is lost
+> (a wrong cipher fails cleanly, just like a wrong password — never garbage). **Migration:**
+> containers written before the cipher option existed use the SHAKE256 keystream — read them with
+> `--cipher shake256` (that mode's on-disk format is byte-identical to the original).
 > Re-randomize is **on by default**; use `--no-rerandomize` for a faster in-place write
 > that leaves a multi-snapshot diffing fingerprint.
 
@@ -172,7 +176,7 @@ cargo test  -p azoth     --release         # shared-core round-trip: create -> 2
 
 ## ✦ Pinned primitives
 
-**Argon2id** (memory-hard KDF; the Python reference uses scrypt) · **SHAKE256** (XOF/PRF) · **SHA-256** (fast hash) · **HMAC-SHA256** (integrity).
+**Argon2id** (memory-hard KDF; the Python reference uses scrypt) · **SHAKE256** (XOF/PRF) · **SHA-256** (fast hash) · **HMAC-SHA256** (integrity) · **payload cipher** — AES-256-CTR (default), ChaCha20, or SHAKE256-keystream, selectable via `--cipher` and bound into the token so a wrong choice fails cleanly.
 
 ## ⚠ Status & honest scope
 
@@ -190,8 +194,26 @@ main caveat that remains **by design**: a *correct guess* of the credential comp
 (the token is an offline oracle gated only by the KDF — use a strong password and high KDF cost).
 The Python reference favors clarity over all of this.
 
-And remember: azoth hides *what* and *how much*, not *that a high-entropy blob exists* — pair it
-with a plausible cover (disk free space, a "wiped" partition, or a benign decoy payload).
+### What azoth does NOT hide (read this first)
+
+⚠ azoth makes a **block of bytes** indistinguishable from random. That is the whole claim, and it is
+narrow. It hides *what* and *how much* is in the block — **to someone who finds the block alone.**
+It does **not** hide:
+
+- **that a high-entropy blob exists** — pair it with a plausible cover for randomness (disk
+  free/slack space, a "wiped" partition);
+- **that you use azoth** — the binary, package records, and shell history (`azoth read --file …`)
+  all point at you, and the bytes' uniformity does nothing about that;
+- **anything under coercion.** If you are compelled to decrypt, running a tool *built to hold hidden
+  payloads* tells the adversary more may exist — and coercion runs on **suspicion, not proof**, so
+  they need not accept that you've revealed everything. A "decoy you reveal under pressure" is **not**
+  a defense (the construction is public; an adversary who knows it just keeps coercing), and we no
+  longer recommend framing it that way.
+
+So: deniable **in isolation**, for a blob found *without you and without the tool* — not a way to
+beat an interrogation. Beating coercion is not a problem cryptography can solve. See
+[`TECHNICAL_DETAILS.md`](TECHNICAL_DETAILS.md) §2 ("Operational / coercion deniability — NOT
+provided").
 
 <div align="center">
 

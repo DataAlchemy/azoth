@@ -13,8 +13,18 @@
 //!
 //! Secrets returned by the library stay in [`zeroize::Zeroizing`] and are never logged.
 
-use crate::{is_recommended_k, KdfParams, Kpdc, DEFAULT_MAXPROBE};
+use crate::{is_recommended_k, Cipher, KdfParams, Kpdc, DEFAULT_MAXPROBE};
 use zeroize::Zeroizing;
+
+/// Stable lowercase label for a cipher, shown in the GUI selector. (The CLIs parse `--cipher`
+/// via their own clap `ValueEnum`, which yields the same `aes-ctr` / `chacha20` / `shake256`.)
+pub fn cipher_label(c: Cipher) -> &'static str {
+    match c {
+        Cipher::Aes256Ctr => "aes-ctr",
+        Cipher::ChaCha20 => "chacha20",
+        Cipher::Shake256 => "shake256",
+    }
+}
 
 /// Recommended Argon2id cost (the default): 256 MiB / 3 passes.
 pub const REC_MEM_MIB: u32 = 256;
@@ -26,13 +36,17 @@ pub const REC_ITERS: u32 = 3;
 /// `INSECURE_FAST_TEST` cost is for tests only and bypasses this front-end policy.)
 pub const MIN_KDF_MEM_MIB: u32 = 19;
 
-/// Decoy-storage tip printed/shown after `create`.
+/// Deniability-scope reminder printed/shown after `create`. Deliberately honest about the limits:
+/// the block is deniable in isolation, but the tool and being compelled to run it are not covered.
 pub const CREATE_TIP: &str = "\
-Tip: a brand-new container is pure noise. Before storing your real secret,
-consider writing one or two *genuine but innocuous* secrets (an old password,
-a mundane note) under their own passwords. If ever compelled, you can reveal
-those — they are real, so they're believable — while the existence of anything
-else stays hidden (computationally deniable to anyone without its password).";
+Note on what this hides: this block is just random bytes — on its own, indistinguishable
+from free space, a wiped disk, or any other encrypted blob. That is ALL it hides: the
+contents and number of payloads in this block, to someone who finds the block alone.
+It does NOT hide that you use azoth (the binary, your shell history, this command), and it
+does NOT survive coercion: if you are compelled to decrypt, a tool built to hold hidden
+payloads invites the demand 'now the others' — and they need not believe you've shown
+everything. Reach for this only when the block can be found WITHOUT you and without the
+tool, with a plausible reason to be random. It is not a way to beat an interrogation.";
 
 /// KDF cost as a user enters it (memory in MiB, iterations). Part of the credential — not
 /// stored in the container, so it must match between write and read.
@@ -163,12 +177,13 @@ pub fn write_block(
     known: &[String],
     k: u64,
     kdf: Kdf,
+    cipher: Cipher,
     maxprobe: usize,
     rerandomize: bool,
     all_keys: bool,
 ) -> Result<(Vec<u8>, String), String> {
     kdf.validate()?;
-    let mut c = Kpdc::from_bytes(block, k, kdf.params()).map_err(|e| e.to_string())?;
+    let mut c = Kpdc::from_bytes_with(block, k, kdf.params(), cipher).map_err(|e| e.to_string())?;
 
     let log = if rerandomize {
         if !all_keys {
@@ -231,10 +246,12 @@ pub fn read_block(
     pw: &str,
     k: u64,
     kdf: Kdf,
+    cipher: Cipher,
     maxprobe: usize,
 ) -> Result<ReadOutcome, String> {
     kdf.validate()?;
-    let c = Kpdc::from_bytes(block.to_vec(), k, kdf.params()).map_err(|e| e.to_string())?;
+    let c = Kpdc::from_bytes_with(block.to_vec(), k, kdf.params(), cipher)
+        .map_err(|e| e.to_string())?;
     Ok(match c.read(pw, maxprobe) {
         Some(pt) => ReadOutcome::Found(pt),
         None => ReadOutcome::NotFound,
@@ -243,7 +260,8 @@ pub fn read_block(
 
 // ---- path convenience wrappers (plain fs) — used by the GUI ----
 
-/// Create a fresh container and write it to `path`. Returns a log line including the decoy tip.
+/// Create a fresh container and write it to `path`. Returns a log line including the
+/// deniability-scope reminder (`CREATE_TIP`).
 pub fn create_container(path: &str, size: usize, k: u64, kdf: Kdf) -> Result<String, String> {
     let bytes = create_block(size, k, kdf)?;
     std::fs::write(path, &bytes).map_err(|e| format!("writing {path}: {e}"))?;
@@ -262,6 +280,7 @@ pub fn write_payload(
     known: &[String],
     k: u64,
     kdf: Kdf,
+    cipher: Cipher,
     rerandomize: bool,
     all_keys: bool,
 ) -> Result<String, String> {
@@ -273,6 +292,7 @@ pub fn write_payload(
         known,
         k,
         kdf,
+        cipher,
         DEFAULT_MAXPROBE,
         rerandomize,
         all_keys,
@@ -282,7 +302,13 @@ pub fn write_payload(
 }
 
 /// Read `path` and attempt to decrypt the payload for `pw`.
-pub fn read_payload(path: &str, pw: &str, k: u64, kdf: Kdf) -> Result<ReadOutcome, String> {
+pub fn read_payload(
+    path: &str,
+    pw: &str,
+    k: u64,
+    kdf: Kdf,
+    cipher: Cipher,
+) -> Result<ReadOutcome, String> {
     let block = std::fs::read(path).map_err(|e| format!("reading {path}: {e}"))?;
-    read_block(&block, pw, k, kdf, DEFAULT_MAXPROBE)
+    read_block(&block, pw, k, kdf, cipher, DEFAULT_MAXPROBE)
 }

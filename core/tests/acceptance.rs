@@ -9,7 +9,7 @@
 //! 4. A wrong password → "no payload" (NotFound).
 
 use azoth::app::{create_container, read_payload, write_payload, Kdf, ReadOutcome};
-use azoth::next_prime_coprime8;
+use azoth::{next_prime_coprime8, Cipher};
 
 /// Removes the temp container even if an assertion panics.
 struct TempFile(String);
@@ -54,6 +54,7 @@ fn acceptance_two_secrets_roundtrip() {
         &[],
         k,
         kdf,
+        Cipher::Aes256Ctr,
         true,
         true,
     )
@@ -65,6 +66,7 @@ fn acceptance_two_secrets_roundtrip() {
         &["alpha-pass".to_string()],
         k,
         kdf,
+        Cipher::Aes256Ctr,
         true,
         true,
     )
@@ -72,16 +74,16 @@ fn acceptance_two_secrets_roundtrip() {
 
     // 3. both round-trip
     assert_eq!(
-        found(read_payload(&path, "alpha-pass", k, kdf).expect("read alpha")),
+        found(read_payload(&path, "alpha-pass", k, kdf, Cipher::Aes256Ctr).expect("read alpha")),
         b"treaty at dawn",
     );
     assert_eq!(
-        found(read_payload(&path, "beta-pass", k, kdf).expect("read beta")),
+        found(read_payload(&path, "beta-pass", k, kdf, Cipher::Aes256Ctr).expect("read beta")),
         b"pier 39",
     );
 
     // 4. wrong password -> NotFound
-    match read_payload(&path, "wrong-pass", k, kdf).expect("read wrong") {
+    match read_payload(&path, "wrong-pass", k, kdf, Cipher::Aes256Ctr).expect("read wrong") {
         ReadOutcome::NotFound => {}
         ReadOutcome::Found(_) => panic!("a wrong password must not decrypt anything"),
     }
@@ -106,6 +108,7 @@ fn rerandomize_requires_all_keys() {
         &[],
         419,
         Kdf::RECOMMENDED,
+        Cipher::Aes256Ctr,
         true,  // re-randomize
         false, // but all-keys NOT confirmed
     )

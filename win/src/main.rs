@@ -10,9 +10,10 @@
 //! thread and the result is delivered back over an mpsc channel; `update()` never blocks.
 
 use azoth::app::{
-    create_container, parse_size, read_payload, write_payload, Kdf, ReadOutcome, REC_ITERS,
-    REC_MEM_MIB,
+    cipher_label, create_container, parse_size, read_payload, write_payload, Kdf, ReadOutcome,
+    REC_ITERS, REC_MEM_MIB,
 };
+use azoth::Cipher;
 use eframe::egui;
 use std::sync::mpsc::{channel, Receiver, TryRecvError};
 use std::thread;
@@ -161,6 +162,7 @@ struct App {
     k_text: String,
     kdf_mem: String,
     kdf_iters: String,
+    cipher: Cipher,
 
     // create tab
     size_text: String,
@@ -192,6 +194,7 @@ impl Default for App {
             k_text: String::new(),
             kdf_mem: REC_MEM_MIB.to_string(),
             kdf_iters: REC_ITERS.to_string(),
+            cipher: Cipher::Aes256Ctr,
             size_text: "64k".to_string(),
             write_pw: String::new(),
             plaintext: String::new(),
@@ -317,6 +320,7 @@ impl App {
         let pw = self.write_pw.clone();
         let rerandomize = self.rerandomize;
         let all_keys = self.all_keys;
+        let cipher = self.cipher;
         self.log_line("working… writing payload");
         self.spawn(move || {
             Job::Log(write_payload(
@@ -326,6 +330,7 @@ impl App {
                 &known,
                 k,
                 kdf,
+                cipher,
                 rerandomize,
                 all_keys,
             ))
@@ -354,8 +359,9 @@ impl App {
         self.read_output.clear();
         self.read_bytes = None;
         let pw = self.read_pw.clone();
+        let cipher = self.cipher;
         self.log_line("working… reading payload");
-        self.spawn(move || Job::Read(read_payload(&path, &pw, k, kdf)));
+        self.spawn(move || Job::Read(read_payload(&path, &pw, k, kdf, cipher)));
     }
 
     /// Handle a finished job from the worker thread.
@@ -427,6 +433,20 @@ impl App {
                     ui.add(egui::TextEdit::singleline(&mut self.kdf_iters).desired_width(60.0));
                 });
                 ui.end_row();
+
+                ui.label("Cipher:");
+                egui::ComboBox::from_id_source("cipher_combo")
+                    .selected_text(cipher_label(self.cipher))
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut self.cipher,
+                            Cipher::Aes256Ctr,
+                            "aes-ctr (default)",
+                        );
+                        ui.selectable_value(&mut self.cipher, Cipher::ChaCha20, "chacha20");
+                        ui.selectable_value(&mut self.cipher, Cipher::Shake256, "shake256");
+                    });
+                ui.end_row();
             });
 
         // Advisory: bad K (mirrors the CLI `warn_if_bad_k`).
@@ -447,6 +467,14 @@ impl App {
                 WARN,
                 "⚠ custom KDF cost is part of the credential and isn't stored — you must use \
                  the exact same values to decrypt.",
+            );
+        }
+        // Advisory: non-default cipher (also part of the credential).
+        if self.cipher != Cipher::Aes256Ctr {
+            ui.colored_label(
+                WARN,
+                "⚠ the cipher is part of the credential and isn't stored — you must read with \
+                 the same cipher you wrote with.",
             );
         }
     }

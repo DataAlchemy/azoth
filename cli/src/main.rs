@@ -7,10 +7,28 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use azoth::app::{self, Kdf, ReadOutcome};
-use azoth::{next_prime_coprime8, KdfParams, Kpdc};
-use clap::{Args, Parser, Subcommand};
+use azoth::{next_prime_coprime8, Cipher, KdfParams, Kpdc};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::io::{Read, Write};
 use zeroize::Zeroizing;
+
+/// Payload cipher selector (part of the credential, like K and the KDF cost — not stored).
+/// Variant names kebab-case to `aes-ctr` / `chacha20` / `shake256` for `--cipher`.
+#[derive(Clone, Copy, ValueEnum)]
+enum CipherArg {
+    AesCtr,
+    Chacha20,
+    Shake256,
+}
+impl From<CipherArg> for Cipher {
+    fn from(c: CipherArg) -> Self {
+        match c {
+            CipherArg::AesCtr => Cipher::Aes256Ctr,
+            CipherArg::Chacha20 => Cipher::ChaCha20,
+            CipherArg::Shake256 => Cipher::Shake256,
+        }
+    }
+}
 
 #[derive(Parser)]
 #[command(
@@ -87,6 +105,10 @@ enum Cmd {
         /// Write straight to a raw target (block device): no temp-file + rename. Auto-enabled for block devices.
         #[arg(long)]
         raw: bool,
+        /// Payload cipher: aes-ctr (default) | chacha20 | shake256. Part of the credential —
+        /// not stored, so you must read with the same value.
+        #[arg(long, default_value = "aes-ctr")]
+        cipher: CipherArg,
         #[command(flatten)]
         kdf: KdfArgs,
     },
@@ -101,6 +123,9 @@ enum Cmd {
         k: u64,
         #[arg(long, default_value_t = azoth::DEFAULT_MAXPROBE)]
         maxprobe: usize,
+        /// Payload cipher: aes-ctr (default) | chacha20 | shake256 (must match the write).
+        #[arg(long, default_value = "aes-ctr")]
+        cipher: CipherArg,
         #[command(flatten)]
         kdf: KdfArgs,
     },
@@ -160,6 +185,7 @@ fn main() -> Result<()> {
             no_rerandomize,
             maxprobe,
             raw,
+            cipher,
             kdf,
         } => {
             let kdf = kdf.to_kdf();
@@ -177,6 +203,7 @@ fn main() -> Result<()> {
                 &known,
                 k,
                 kdf,
+                cipher.into(),
                 maxprobe,
                 !no_rerandomize,
                 all_keys,
@@ -190,6 +217,7 @@ fn main() -> Result<()> {
             password,
             k,
             maxprobe,
+            cipher,
             kdf,
         } => {
             let kdf = kdf.to_kdf();
@@ -198,7 +226,9 @@ fn main() -> Result<()> {
             warn_if_custom_kdf(kdf);
             let pw = resolve_password(password)?;
             let block = std::fs::read(&file).with_context(|| format!("reading {}", file))?;
-            match app::read_block(&block, &pw, k, kdf, maxprobe).map_err(anyhow::Error::msg)? {
+            match app::read_block(&block, &pw, k, kdf, cipher.into(), maxprobe)
+                .map_err(anyhow::Error::msg)?
+            {
                 ReadOutcome::Found(pt) => std::io::stdout().write_all(&pt).context("stdout")?,
                 ReadOutcome::NotFound => {
                     bail!("no payload for that (password, K, KDF cost) — just noise")
