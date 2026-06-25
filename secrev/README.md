@@ -34,9 +34,12 @@ default re-randomizing write. Confirmed empirically and as a contrast below.
 
 ## Methodology
 
-All controls were generated **from the real library** (`azoth/src/lib.rs`), so they are the same
-statistical object as the challenge. KDF cost does not affect the byte distribution (per the
-challenge and verified), so a cheap cost (Argon2id 1 MiB / 1 pass) was used to generate volume.
+All controls were generated **from the real library** (`core/src/lib.rs`, the `azoth` crate), so
+they are the same statistical object as the challenge. KDF cost does not affect the byte
+distribution (per the challenge and verified), so a cheap cost (Argon2id 1 MiB / 1 pass) was used
+to generate volume. The byte distribution is also independent of the payload cipher (the
+restructured core made the cipher selectable, default AES-256-CTR; all variants are IND$ stream
+ciphers), so controls remain valid matched controls regardless of which cipher built the challenge.
 
 | Control set | n | What it is |
 |---|---|---|
@@ -45,9 +48,9 @@ challenge and verified), so a cheap cost (Argon2id 1 MiB / 1 pass) was used to g
 | `control_fullmax_*`| 4  | filled to plane capacity (~99.99 %) |
 | `control_random` / `urandom.bin` | 2 | true uniform random |
 
-Generators: `scripts/make_controls.rs`, `scripts/make_snapshots.rs` (copies of the
-`azoth/examples/*.rs` used). Analyses: the Python scripts in `scripts/`. Captured outputs are in
-`raw_output/`.
+Generators: `scripts/make_controls.rs`, `scripts/make_snapshots.rs` — reference copies of the
+buildable Cargo examples at `core/examples/*.rs`. Analyses: the Python scripts in `scripts/`.
+Captured outputs are in `raw_output/`.
 
 ---
 
@@ -166,13 +169,14 @@ standard AE core with no shortcut. Every wrong-password read returns "just noise
 ```bash
 cd /prod/multicrypt
 
-# 1) build controls from the real library (cheap KDF; distribution is cost-independent)
-cargo build --release --manifest-path azoth/Cargo.toml --example make_controls
-cargo build --release --manifest-path azoth/Cargo.toml --example make_snapshots
+# 1) build controls from the real library (cheap KDF; distribution is cost-independent).
+#    The library is the `azoth` package under core/; the generators are its Cargo examples.
+#    (Workspace build — binaries land in the shared root target/, not core/target/.)
+cargo build --release -p azoth --example make_controls --example make_snapshots
 mkdir -p controls snapshots
 head -c 65536 /dev/urandom > controls/urandom.bin
-( cd controls && /prod/multicrypt/azoth/target/release/examples/make_controls 32 32 )
-azoth/target/release/examples/make_snapshots 32 snapshots
+( cd controls && /prod/multicrypt/target/release/examples/make_controls 32 32 )
+target/release/examples/make_snapshots 32 snapshots
 
 # 2) run the battery (scripts expect to run from the repo root)
 python3 secrev/scripts/battery.py
@@ -186,6 +190,11 @@ python3 secrev/scripts/k_analysis.py
 Note: the Python scripts read `challenge_block.bin`, `controls/`, and `snapshots/` by relative
 path, so run them from `/prod/multicrypt`. Empirical (simulation-based) numbers vary slightly per
 run; analytic numbers are exact.
+
+Note on the CLI: the generators call the library directly at 1 MiB Argon2id for speed. The
+hardened `azoth` CLI now enforces a ~19 MiB Argon2id floor (OWASP), so a control built at 1 MiB
+cannot be read back through the CLI — this is irrelevant to the battery, which only analyzes bytes.
+To sanity-check a round-trip, read at the library level (no floor) or build a control at ≥19 MiB.
 
 ---
 
